@@ -1,0 +1,71 @@
+{
+  "id": "mobile-like",
+  "name": "mobile-like",
+  "description": "Mobile-style viewport — touch-enabled, high-DPI, portrait",
+  "schema_version": 1,
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-01T00:00:00Z",
+  "tags": ["windows11", "mobile", "touch"],
+  "hardware": {
+    "cpu_cores": 4,
+    "gpu_vendor": "Google Inc. (Qualcomm)",
+    "gpu_renderer": "ANGLE (Qualcomm, Qualcomm(R) Adreno(TM) 650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "ram_mb": 4096,
+    "platform": "Win32",
+    "max_touch_points": 5
+  },
+  "browser": {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "app_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "vendor": "Google Inc.",
+    "vendor_sub": "",
+    "product": "Gecko",
+    "product_sub": "20030107",
+    "languages": ["en-US", "en"],
+    "do_not_track": "",
+    "cookie_enabled": true
+  },
+  "screen": {
+    "width": 390,
+    "height": 844,
+    "avail_width": 390,
+    "avail_height": 844,
+    "color_depth": 24,
+    "pixel_depth": 24,
+    "device_pixel_ratio": 3.0,
+    "orientation": "portrait-primary"
+  },
+  "network": {
+    "timezone": "America/New_York",
+    "proxy_url": "",
+    "dns_servers": []
+  },
+  "noise": {
+    "canvas_seed": 0,
+    "audio_seed": 0,
+    "webgl_seed": 0,
+    "font_seed": 0
+  },
+  "storage": {
+    "enable_cookies": true,
+    "enable_local_storage": true,
+    "enable_session_storage": true,
+    "enable_indexed_db": true,
+    "enable_cache_storage": true,
+    "enable_service_worker": true,
+    "max_cookie_jar_mb": 0,
+    "max_storage_mb": 0
+  },
+  "permissions": {
+    "geolocation": "prompt",
+    "notifications": "deny",
+    "microphone": "deny",
+    "camera": "deny",
+    "clipboard": "prompt",
+    "full_screen": "prompt",
+    "payment_handler": "deny",
+    "midi": "deny",
+    "usb": "deny",
+    "bluetooth": "deny"
+  }
+}

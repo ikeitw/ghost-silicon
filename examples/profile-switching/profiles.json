@@ -1,0 +1,53 @@
+[
+  {
+    "_comment": "Example profiles used by the profile-switching example.",
+    "id": "switch-desktop-001",
+    "name": "switch-desktop",
+    "description": "Switching example — desktop",
+    "schema_version": 1,
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-01T00:00:00Z",
+    "tags": ["example", "windows11", "desktop"],
+    "hardware": {
+      "cpu_cores": 8,
+      "gpu_vendor": "Google Inc. (NVIDIA)",
+      "gpu_renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "ram_mb": 16384,
+      "platform": "Win32",
+      "max_touch_points": 0
+    },
+    "browser": {
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "app_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "vendor": "Google Inc.",
+      "vendor_sub": "",
+      "product": "Gecko",
+      "product_sub": "20030107",
+      "languages": ["en-US", "en"],
+      "do_not_track": "",
+      "cookie_enabled": true
+    },
+    "screen": {
+      "width": 1920, "height": 1080,
+      "avail_width": 1920, "avail_height": 1040,
+      "color_depth": 24, "pixel_depth": 24,
+      "device_pixel_ratio": 1.0,
+      "orientation": "landscape-primary"
+    },
+    "network": { "timezone": "America/New_York", "proxy_url": "", "dns_servers": [] },
+    "noise": { "canvas_seed": 0, "audio_seed": 0, "webgl_seed": 0, "font_seed": 0 },
+    "storage": {
+      "enable_cookies": true, "enable_local_storage": true,
+      "enable_session_storage": true, "enable_indexed_db": true,
+      "enable_cache_storage": true, "enable_service_worker": true,
+      "max_cookie_jar_mb": 0, "max_storage_mb": 0
+    },
+    "permissions": {
+      "geolocation": "deny", "notifications": "deny",
+      "microphone": "deny", "camera": "deny",
+      "clipboard": "prompt", "full_screen": "prompt",
+      "payment_handler": "deny", "midi": "deny",
+      "usb": "deny", "bluetooth": "deny"
+    }
+  }
+]

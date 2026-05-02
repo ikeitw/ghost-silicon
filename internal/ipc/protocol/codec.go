@@ -63,3 +63,17 @@ func (c *Codec) WriteError(id *RequestID, code int, msg string) error {
 		Error: &RPCError{Code: code, Message: msg},
 	})
 }
+
+// ReadResponse reads the next response from the wire.
+// Used by client-side callers (e.g. renderer-mock).
+func (c *Codec) ReadResponse() (*Response, error) {
+	frame, err := ReadFrame(c.rw)
+	if err != nil {
+		return nil, fmt.Errorf("codec: read response frame: %w", err)
+	}
+	var resp Response
+	if err := frame.DecodeJSON(&resp); err != nil {
+		return nil, fmt.Errorf("codec: decode response: %w", err)
+	}
+	return &resp, nil
+}

@@ -1,0 +1,20 @@
+# configs/windows-runtime.yaml
+# Windows 11 runtime overlay — applied on top of ghost-silicon.yaml.
+# Contains Windows-specific tuning for the sandbox and IPC layers.
+
+sandbox:
+  enable_job_object: true
+  enable_restricted_token: true
+  integrity_level: medium
+  enable_app_container: false
+  memory_limit_mb: 4096
+  cpu_rate_percent: 0
+
+ipc:
+  pipe_name: "\\\\.\\ pipe\\ghost-silicon-bridge"
+  read_timeout: 10s
+  write_timeout: 10s
+
+telemetry:
+  level: info
+  format: text

@@ -5,7 +5,10 @@
 // pulling in the full IPC package.
 package renderer
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Event is a lifecycle or navigation event emitted by the renderer.
 type Event struct {
@@ -41,5 +44,19 @@ const (
 	EvtProcessExited      = "process.exited"
 )
 
-// EventHandler is a callback invoked when the renderer emits an event.
-type EventHandler func(ev Event)
+// MockProcessHandle is a test double for renderer.Process.
+// Export it so external test packages can use it.
+type MockProcessHandle struct {
+	PIDVal  uint32
+	Running bool
+}
+
+func (m *MockProcessHandle) PID() uint32                            { return m.PIDVal }
+func (m *MockProcessHandle) IsRunning() bool                        { return m.Running }
+func (m *MockProcessHandle) Terminate() error                       { m.Running = false; return nil }
+func (m *MockProcessHandle) Wait(_ context.Context) (uint32, error) { return 0, nil }
+
+// NewMockProcess creates a MockProcessHandle with the given PID that reports as running.
+func NewMockProcess(pid uint32) *MockProcessHandle {
+	return &MockProcessHandle{PIDVal: pid, Running: true}
+}

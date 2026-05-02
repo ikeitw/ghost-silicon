@@ -1,0 +1,22 @@
+# examples/isolated-renderer-windows/config.yaml
+# Example config overlay for the isolated-renderer-windows example.
+
+engine:
+  executable: "C:\\path\\to\\renderer.exe"
+  start_timeout: 30s
+  crash_restart_limit: 3
+  crash_restart_delay: 2s
+
+sandbox:
+  enable_job_object: true
+  enable_restricted_token: true
+  integrity_level: medium
+  memory_limit_mb: 2048
+  cpu_rate_percent: 80
+
+ipc:
+  pipe_name: "\\\\.\\ pipe\\ghost-silicon-bridge"
+
+telemetry:
+  level: debug
+  format: text

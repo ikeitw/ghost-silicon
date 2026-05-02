@@ -1,0 +1,9 @@
+# configs/sandbox-policy.yaml
+# Windows process isolation settings for the renderer.
+
+enable_job_object: true
+enable_restricted_token: true
+integrity_level: medium     # low | medium | high
+enable_app_container: false
+memory_limit_mb: 0          # 0 = unlimited
+cpu_rate_percent: 0         # 0 = unlimited (1-100 to cap)

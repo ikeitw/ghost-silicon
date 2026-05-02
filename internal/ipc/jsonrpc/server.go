@@ -144,3 +144,28 @@ func isClosedConnError(err error) bool {
 	}
 	return err.Error() == "use of closed network connection"
 }
+
+// IsRegistered reports whether method has a registered handler.
+// Useful in tests to verify bridge registration without a live connection.
+func (s *Server) IsRegistered(method string) bool {
+	_, ok := s.handlers[method]
+	return ok
+}
+
+// Call invokes a registered handler directly without going through the wire.
+// Returns the JSON-encoded result or an error. Useful in unit tests.
+func (s *Server) Call(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	h, ok := s.handlers[method]
+	if !ok {
+		return nil, fmt.Errorf("jsonrpc: method %q not registered", method)
+	}
+	result, err := h(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("jsonrpc: marshal result: %w", err)
+	}
+	return data, nil
+}

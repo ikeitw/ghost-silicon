@@ -1,0 +1,23 @@
+# configs/network-policy.yaml
+# Network ACL rules for the renderer session.
+# Rules are evaluated top-to-bottom; first match wins.
+# If no rule matches, default_action is applied.
+
+default_action: allow
+
+rules:
+  # Block known telemetry and tracking endpoints.
+  - host: "*.google-analytics.com"
+    action: deny
+  - host: "*.doubleclick.net"
+    action: deny
+  - host: "*.googlesyndication.com"
+    action: deny
+  - host: "*.facebook.com"
+    action: deny
+  - host: "*.facebook.net"
+    action: deny
+
+  # Allow everything else.
+  - host: "*"
+    action: allow

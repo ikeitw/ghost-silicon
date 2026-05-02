@@ -1,0 +1,18 @@
+# configs/renderer-policy.yaml
+# Controls renderer engine behaviour and feature flags.
+
+# start_timeout is how long to wait for the renderer to signal readiness.
+start_timeout: 30s
+
+# crash_restart_limit is the maximum consecutive crashes before giving up.
+crash_restart_limit: 3
+
+# crash_restart_delay is the initial backoff between restart attempts.
+crash_restart_delay: 2s
+
+# extra_args are appended to the renderer command line on every launch.
+extra_args: []
+
+# log_level controls how verbose the renderer's own log output is.
+# Accepted values depend on the specific renderer binary.
+log_level: info

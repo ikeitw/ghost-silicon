@@ -64,6 +64,9 @@ func (b *Bridge) UpdateProfile(p *identity.Profile) {
 	b.log.Info("bridge profile updated", logging.FieldProfileID, p.ID)
 }
 
+// Profile returns the currently active profile.
+func (b *Bridge) Profile() *identity.Profile { return b.profile }
+
 // ── hardware handlers ────────────────────────────────────────────────────────
 
 func (b *Bridge) handleGetCPUCores(_ context.Context) (any, error) {

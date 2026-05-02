@@ -1,0 +1,12 @@
+# configs/javascript-policy.yaml
+# Controls which JavaScript APIs the renderer exposes and which are
+# replaced with profile-backed values.
+
+canvas_noise_enabled: true
+audio_noise_enabled: true
+webgl_noise_enabled: true
+font_noise_enabled: true
+hardware_concurrency_override: true
+device_memory_override: true
+webrtc_policy: disable        # disable | proxy | allow
+timer_precision_ms: 0         # 0 = full precision

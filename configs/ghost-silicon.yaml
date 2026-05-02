@@ -1,0 +1,68 @@
+# configs/ghost-silicon.yaml
+# Main configuration file for ghost-silicon.
+# Override individual fields; anything not set falls back to the built-in defaults.
+
+app:
+  name: ghost-silicon
+  data_dir: ""          # empty = %APPDATA%\ghost-silicon on Windows
+  shutdown_timeout: 15s
+
+engine:
+  executable: ""        # required: full path to your renderer binary
+  args: []
+  start_timeout: 30s
+  crash_restart_limit: 3
+  crash_restart_delay: 2s
+
+identity:
+  profile_dir: ""       # empty = <data_dir>/profiles
+  default_profile: ""   # empty = first profile found, or auto-generated
+  auto_generate: true
+  default_template: windows11-desktop
+  rotation:
+    trigger: never      # never | on_session | on_interval | on_request_count
+
+network:
+  proxy_url: ""         # empty = no proxy; e.g. "socks5://127.0.0.1:1080"
+  dns_servers: []       # empty = system DNS
+  dial_timeout: 10s
+  tls_handshake_timeout: 10s
+  response_header_timeout: 30s
+  max_idle_conns_per_host: 10
+  policy:
+    allowed_hosts: []   # empty = allow all
+    blocked_hosts: []
+    allowed_ports: []   # empty = allow all
+
+sandbox:
+  enable_job_object: true
+  enable_restricted_token: true
+  integrity_level: medium   # low | medium | high
+  enable_app_container: false
+  memory_limit_mb: 0        # 0 = unlimited
+  cpu_rate_percent: 0       # 0 = unlimited
+
+ipc:
+  pipe_name: "\\\\.\\ pipe\\ghost-silicon-bridge"
+  enable_websocket: false
+  websocket_addr: "127.0.0.1:9222"
+  read_timeout: 10s
+  write_timeout: 10s
+
+storage:
+  base_dir: ""          # empty = <data_dir>/sessions
+  encrypt_at_rest: false
+  max_session_age_days: 0   # 0 = keep forever
+
+telemetry:
+  level: info           # debug | info | warn | error
+  format: text          # text | json
+  log_file: ""          # empty = stderr only
+  audit_file: ""        # empty = no audit file
+  metrics_addr: ""      # empty = metrics disabled
+
+api:
+  enabled: false
+  addr: "127.0.0.1:9223"
+  read_timeout: 15s
+  write_timeout: 15s

@@ -1,0 +1,14 @@
+# examples/custom-network-policy/network-policy.yaml
+# Example custom network ACL policy.
+
+default_action: allow
+
+rules:
+  - host: "*.google-analytics.com"
+    action: deny
+  - host: "*.doubleclick.net"
+    action: deny
+  - host: "ads.example.com"
+    action: deny
+  - host: "*"
+    action: allow

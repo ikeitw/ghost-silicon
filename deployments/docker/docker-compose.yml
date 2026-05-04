@@ -1,0 +1,56 @@
+# deployments/docker/docker-compose.yml
+# Docker Compose definition for ghost-silicon on Linux.
+
+services:
+  ghost-silicon:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+      args:
+        VERSION: "0.1.0"
+        COMMIT: "${GIT_COMMIT:-unknown}"
+        BUILD_TIME: "${BUILD_TIME:-unknown}"
+    image: ghost-silicon:latest
+    container_name: ghost-silicon
+
+    # Data persistence
+    volumes:
+      - ghost-silicon-data:/var/lib/ghost-silicon
+      - ./configs:/etc/ghost-silicon:ro
+
+    # Environment overrides
+    environment:
+      GS_LOG_LEVEL: info
+      GS_LOG_FORMAT: json
+      GS_DATA_DIR: /var/lib/ghost-silicon
+
+    # Local control API (only if api.enabled: true in config)
+    ports:
+      - "127.0.0.1:9223:9223"
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+    # Security
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["/ghost-silicon", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ghost-silicon-data:
+    driver: local

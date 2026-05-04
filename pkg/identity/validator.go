@@ -164,7 +164,7 @@ func validateBrowser(b *BrowserProfile, r *ValidationResult) {
 	}
 	for i, lang := range b.Languages {
 		if strings.TrimSpace(lang) == "" {
-			r.addf("browser.languages[%d]", i, "must not be empty")
+			r.add(fmt.Sprintf("browser.languages[%d]", i), "must not be empty")
 		}
 	}
 	if b.DoNotTrack != "" && b.DoNotTrack != "0" && b.DoNotTrack != "1" {

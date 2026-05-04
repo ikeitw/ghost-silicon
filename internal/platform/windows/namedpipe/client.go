@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -58,12 +59,20 @@ func Client(name string, timeout time.Duration) (net.Conn, error) {
 			return nil, fmt.Errorf("namedpipe/client: timed out waiting for pipe %q", name)
 		}
 
-		// WaitNamedPipe blocks until the pipe becomes available or the timeout elapses.
 		namePtr, _ := windows.UTF16PtrFromString(name)
 		remaining := time.Until(deadline)
-		_ = windows.WaitNamedPipe(namePtr, uint32(remaining.Milliseconds()))
+		ms := uint32(remaining.Milliseconds())
+		if ms == 0 {
+			ms = 1
+		}
+		procWaitNamedPipe.Call(uintptr(unsafe.Pointer(namePtr)), uintptr(ms))
 	}
 }
+
+var (
+	modKernel32Pipe   = windows.NewLazySystemDLL("kernel32.dll")
+	procWaitNamedPipe = modKernel32Pipe.NewProc("WaitNamedPipeW")
+)
 
 func openPipe(name string) (windows.Handle, error) {
 	namePtr, err := windows.UTF16PtrFromString(name)

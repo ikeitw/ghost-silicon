@@ -1,0 +1,49 @@
+# deployments/podman/Containerfile
+# Podman-compatible container image for ghost-silicon on Linux.
+# Identical to the Dockerfile but named Containerfile per Podman convention.
+# Build: podman build -f deployments/podman/Containerfile -t ghost-silicon .
+
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=0.1.0
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags "-X ghost-silicon/pkg/version.CommitHash=${COMMIT} \
+              -X ghost-silicon/pkg/version.BuildTime=${BUILD_TIME} \
+              -X ghost-silicon/pkg/version.Version=${VERSION} \
+              -s -w" \
+    -o /ghost-silicon \
+    ./cmd/ghost-silicon
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+FROM scratch
+
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /ghost-silicon /ghost-silicon
+
+COPY configs/  /etc/ghost-silicon/
+COPY profiles/ /etc/ghost-silicon/profiles/
+
+VOLUME ["/var/lib/ghost-silicon"]
+
+EXPOSE 9223
+
+ENV GS_DATA_DIR=/var/lib/ghost-silicon
+ENV GS_LOG_FORMAT=json
+ENV GS_LOG_LEVEL=info
+
+ENTRYPOINT ["/ghost-silicon"]
+CMD ["-config", "/etc/ghost-silicon/ghost-silicon.yaml"]

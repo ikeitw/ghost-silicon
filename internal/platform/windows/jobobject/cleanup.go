@@ -9,12 +9,26 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// jobBasicAccountingInfo mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+// Defined manually because golang.org/x/sys/windows does not expose it.
+type jobBasicAccountingInfo struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
 // ProcessCount returns the number of processes currently in the job.
 func (jo *JobObject) ProcessCount() (uint32, error) {
-	var info windows.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+	var info jobBasicAccountingInfo
+	const jobObjectBasicAccountingInformation = 1
 	ret, _, err := procQueryInformationJobObject.Call(
 		uintptr(jo.handle),
-		uintptr(windows.JobObjectBasicAccountingInformation),
+		uintptr(jobObjectBasicAccountingInformation),
 		uintptr(unsafe.Pointer(&info)),
 		uintptr(unsafe.Sizeof(info)),
 		0,
@@ -26,7 +40,6 @@ func (jo *JobObject) ProcessCount() (uint32, error) {
 }
 
 // Terminate signals all processes in the job with the given exit code.
-// After this call the job is drained; Close() should be called next.
 func (jo *JobObject) Terminate(exitCode uint32) error {
 	ret, _, err := procTerminateJobObject.Call(
 		uintptr(jo.handle),
@@ -42,3 +55,6 @@ var (
 	procQueryInformationJobObject = modKernel32.NewProc("QueryInformationJobObject")
 	procTerminateJobObject        = modKernel32.NewProc("TerminateJobObject")
 )
+
+// ensure windows import is used
+var _ = windows.CloseHandle

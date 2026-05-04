@@ -149,9 +149,8 @@ func connectNamedPipe(h windows.Handle) error {
 	defer windows.CloseHandle(event) //nolint:errcheck
 	ov.HEvent = event
 
-	_, err = windows.ConnectNamedPipe(h, &ov)
+	err = windows.ConnectNamedPipe(h, &ov)
 	if err == windows.ERROR_IO_PENDING {
-		// Wait for the overlapped operation to complete.
 		_, err = windows.WaitForSingleObject(event, uint32(30*time.Second/time.Millisecond))
 	}
 	if err == windows.ERROR_PIPE_CONNECTED {

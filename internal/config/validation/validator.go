@@ -101,12 +101,12 @@ func validateNetwork(n *schema.NetworkConfig, r *Result) {
 	}
 	for i, h := range n.Policy.BlockedHosts {
 		if strings.TrimSpace(h) == "" {
-			r.addf("network.policy.blocked_hosts[%d]", i, "must not be blank")
+			r.add(fmt.Sprintf("network.policy.blocked_hosts[%d]", i), "must not be blank")
 		}
 	}
 	for i, h := range n.Policy.AllowedHosts {
 		if strings.TrimSpace(h) == "" {
-			r.addf("network.policy.allowed_hosts[%d]", i, "must not be blank")
+			r.add(fmt.Sprintf("network.policy.allowed_hosts[%d]", i), "must not be blank")
 		}
 	}
 }

@@ -1,0 +1,43 @@
+# deployments/docker/.dockerignore
+# Files excluded from the Docker build context.
+
+# Build artifacts
+bin/
+dist/
+*.exe
+
+# Test and coverage
+coverage.out
+coverage.html
+*.test
+
+# Development files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Documentation (not needed in image)
+docs/
+
+# Examples and tools (not needed in image)
+examples/
+tools/
+
+# Test directories
+test/

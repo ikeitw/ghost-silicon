@@ -51,7 +51,8 @@ func (jo *JobObject) AssignProcess(h windows.Handle) error {
 
 // AssignPID adds the process identified by pid to the job.
 func (jo *JobObject) AssignPID(pid uint32) error {
-	h, err := windows.OpenProcess(windows.PROCESS_ALL_ACCESS, false, pid)
+	const processAllAccess = 0x1F0FFF
+	h, err := windows.OpenProcess(processAllAccess, false, pid)
 	if err != nil {
 		return fmt.Errorf("jobobject: OpenProcess(%d): %w", pid, err)
 	}

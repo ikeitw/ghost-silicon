@@ -1,0 +1,40 @@
+# deployments/podman/podman-compose.yml
+# Podman Compose definition for ghost-silicon on Linux.
+# Usage: podman-compose -f deployments/podman/podman-compose.yml up
+
+version: "3.8"
+
+services:
+  ghost-silicon:
+    build:
+      context: ../..
+      dockerfile: deployments/podman/Containerfile
+      args:
+        VERSION: "0.1.0"
+    image: localhost/ghost-silicon:latest
+    container_name: ghost-silicon
+
+    volumes:
+      - ghost-silicon-data:/var/lib/ghost-silicon:Z
+      - ../../configs:/etc/ghost-silicon:ro,Z
+
+    environment:
+      GS_LOG_LEVEL: info
+      GS_LOG_FORMAT: json
+      GS_DATA_DIR: /var/lib/ghost-silicon
+
+    # Local control API — only exposed on loopback.
+    ports:
+      - "127.0.0.1:9223:9223"
+
+    # Podman rootless security
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+
+    restart: unless-stopped
+
+volumes:
+  ghost-silicon-data:

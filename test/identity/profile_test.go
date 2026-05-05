@@ -85,13 +85,13 @@ func TestDeviceMemoryGB_Bucketing(t *testing.T) {
 		ramMb    int
 		expected float64
 	}{
-		{512, 0.25},
-		{1024, 0.5},
-		{2048, 1},
-		{4096, 2},
-		{8192, 4},
-		{16384, 8},
-		{32768, 8},
+		{512, 0.5}, // 0.5 GB → bucket 0.5
+		{1024, 1},  // 1 GB   → bucket 1
+		{2048, 2},  // 2 GB   → bucket 2
+		{4096, 4},  // 4 GB   → bucket 4
+		{8192, 8},  // 8 GB   → bucket 8
+		{16384, 8}, // 16 GB  → capped at 8
+		{32768, 8}, // 32 GB  → capped at 8
 	}
 	for _, c := range cases {
 		h := identity.HardwareProfile{RAMMb: c.ramMb}

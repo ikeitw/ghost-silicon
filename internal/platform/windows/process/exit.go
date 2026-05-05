@@ -9,6 +9,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// stillActive is the STILL_ACTIVE exit code (259) returned by
+// GetExitCodeProcess when the process has not yet terminated.
+const stillActive = 259
+
+// ExitCode retrieves the exit code of a process handle.
+// Returns 259 (STILL_ACTIVE) when the process has not yet exited.
 func ExitCode(h windows.Handle) (uint32, error) {
 	var code uint32
 	if err := windows.GetExitCodeProcess(h, &code); err != nil {
@@ -17,21 +23,23 @@ func ExitCode(h windows.Handle) (uint32, error) {
 	return code, nil
 }
 
+// IsStillActive returns true when the process has not yet exited.
 func IsStillActive(h windows.Handle) bool {
 	code, err := ExitCode(h)
 	if err != nil {
 		return false
 	}
-	return code == windows.STILL_ACTIVE
+	return code == stillActive
 }
 
+// ExitCodeString returns a human-readable description of a Windows exit code.
 func ExitCodeString(code uint32) string {
 	switch code {
 	case 0:
 		return "success (0)"
 	case 1:
 		return "generic error (1)"
-	case windows.STILL_ACTIVE:
+	case stillActive:
 		return "still running"
 	case 0xC0000005:
 		return "access violation (0xC0000005)"

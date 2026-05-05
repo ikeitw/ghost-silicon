@@ -71,5 +71,5 @@ func (p *Process) IsRunning() bool {
 	if err != nil {
 		return false
 	}
-	return code == windows.STILL_ACTIVE
+	return code == stillActive
 }

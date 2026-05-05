@@ -70,7 +70,7 @@ func NewTransport(opts TransportOptions) (*Transport, error) {
 	}
 
 	if opts.ProxyFunc != nil {
-		inner.Proxy = http.ProxyFunc(opts.ProxyFunc)
+		inner.Proxy = opts.ProxyFunc
 	}
 
 	return &Transport{

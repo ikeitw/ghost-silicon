@@ -6,6 +6,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"ghost-silicon/internal/config/loader"
@@ -68,7 +69,7 @@ func Run(opts Options) (*App, error) {
 			_ = closer // lifecycle managed by App shutdown
 			auditor = a
 		} else {
-			auditor = audit.New(log)
+			auditor = audit.New(os.Stderr)
 		}
 	}
 

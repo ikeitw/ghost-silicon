@@ -28,10 +28,8 @@ func CurrentUserSecurityAttributes() (*windows.SecurityAttributes, error) {
 
 	// Build a DACL that grants GENERIC_ALL to the current user only.
 	// SDDL: D:(A;;GA;;;<SID>)
-	sidStr, err := user.User.Sid.String()
-	if err != nil {
-		return nil, fmt.Errorf("namedpipe/security: SID to string: %w", err)
-	}
+	// Sid.String() returns only a string in golang.org/x/sys/windows (no error).
+	sidStr := user.User.Sid.String()
 
 	sddl := fmt.Sprintf("D:(A;;GA;;;%s)", sidStr)
 	sd, err := windows.SecurityDescriptorFromString(sddl)

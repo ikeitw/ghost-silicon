@@ -47,13 +47,18 @@ func (b *EnvBuilder) Remove(keys ...string) *EnvBuilder {
 	return b
 }
 
-// SetProfileEnv injects ghost-silicon profile metadata as env vars so the
-// renderer adapter can pick them up on startup without needing IPC.
-func (b *EnvBuilder) SetProfileEnv(profileID, sessionID, pipeName string) *EnvBuilder {
-	b.Set("GS_PROFILE_ID", profileID)
+// SetSession injects ghost-silicon session metadata as env vars so the
+// renderer adapter can bootstrap without a round-trip over the pipe.
+func (b *EnvBuilder) SetSession(sessionID, profileID, pipeName string) *EnvBuilder {
 	b.Set("GS_SESSION_ID", sessionID)
+	b.Set("GS_PROFILE_ID", profileID)
 	b.Set("GS_PIPE_NAME", pipeName)
 	return b
+}
+
+// SetProfileEnv is an alias for SetSession kept for compatibility.
+func (b *EnvBuilder) SetProfileEnv(profileID, sessionID, pipeName string) *EnvBuilder {
+	return b.SetSession(sessionID, profileID, pipeName)
 }
 
 // Build returns the final []string environment slice.

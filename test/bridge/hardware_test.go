@@ -4,6 +4,7 @@ package bridge_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"testing"
 
 	"ghost-silicon/internal/ipc/jsonrpc"
@@ -17,7 +18,7 @@ import (
 func newBridgeServer(t *testing.T, p *identity.Profile) *jsonrpc.Server {
 	t.Helper()
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	srv := jsonrpc.NewServer(log)
 	br := bridge.New(p, "test-session", log, aud)
 	br.Register(srv)

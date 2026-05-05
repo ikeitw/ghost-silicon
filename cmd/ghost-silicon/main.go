@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 
 	"ghost-silicon/internal/app/bootstrap"
@@ -72,7 +73,7 @@ func run() error {
 	}
 
 	// ── Load or generate profile ─────────────────────────────────────────
-	activeProfile, err := resolveProfile(profileStore, cfg.Identity)
+	activeProfile, err := resolveProfile(profileStore, cfg.Identity.DefaultProfile, cfg.Identity.AutoGenerate)
 	if err != nil {
 		return fmt.Errorf("resolve profile: %w", err)
 	}
@@ -135,12 +136,8 @@ func run() error {
 	// IPC bridge hook
 	lc.OnStart("ipc-bridge", func(ctx context.Context) error {
 		go func() {
-			_ = pipeListener.Serve(ctx, func(conn interface {
-				Read([]byte) (int, error)
-				Write([]byte) (int, error)
-				Close() error
-			}) {
-				// net.Conn is embedded — handler receives it via the Serve callback.
+			_ = pipeListener.Serve(ctx, func(conn net.Conn) {
+				rpcSrv.ServeConn(ctx, conn)
 			})
 		}()
 		return nil

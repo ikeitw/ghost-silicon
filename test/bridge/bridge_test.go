@@ -4,6 +4,7 @@ package bridge_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"testing"
 
 	"ghost-silicon/internal/ipc/jsonrpc"
@@ -17,7 +18,7 @@ import (
 func newTestBridge(t *testing.T) (*bridge.Bridge, *jsonrpc.Server) {
 	t.Helper()
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	p := identity.Windows11DesktopTemplate()
 	srv := jsonrpc.NewServer(log)
 	br := bridge.New(p, "test-session", log, aud)
@@ -27,7 +28,7 @@ func newTestBridge(t *testing.T) (*bridge.Bridge, *jsonrpc.Server) {
 
 func TestBridge_ProfileUpdated(t *testing.T) {
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	p := identity.Windows11DesktopTemplate()
 	srv := jsonrpc.NewServer(log)
 	br := bridge.New(p, "test-session", log, aud)
@@ -66,7 +67,7 @@ func TestBridge_RegistersAllMethods(t *testing.T) {
 
 func TestBridge_HandleGetSessionInfo(t *testing.T) {
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	p := identity.Windows11DesktopTemplate()
 	const wantSession = "my-test-session"
 	srv := jsonrpc.NewServer(log)
@@ -90,7 +91,7 @@ func TestBridge_HandleGetSessionInfo(t *testing.T) {
 
 func TestBridge_GetStoragePolicy(t *testing.T) {
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	p := identity.Windows11DesktopTemplate()
 	p.Storage.EnableCookies = true
 	p.Storage.EnableLocalStorage = false
@@ -119,7 +120,7 @@ func TestBridge_GetStoragePolicy(t *testing.T) {
 
 func TestBridge_GetNetworkProfile(t *testing.T) {
 	log := logging.Nop()
-	aud := audit.New(log)
+	aud := audit.New(io.Discard)
 	p := identity.Windows11DesktopTemplate()
 	p.Network.Timezone = "Europe/Amsterdam"
 	p.Network.ProxyURL = "socks5://127.0.0.1:1080"

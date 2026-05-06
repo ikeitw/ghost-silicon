@@ -174,12 +174,29 @@ func buildCommandLine(exe string, args []string) string {
 
 // buildEnvBlock converts a []string env slice to a UTF-16 double-null
 // terminated environment block suitable for CreateProcess.
+// windows.UTF16PtrFromString rejects strings containing embedded null bytes,
+// so we build the []uint16 block manually.
 func buildEnvBlock(env []string) (*uint16, error) {
 	if env == nil {
 		env = os.Environ()
 	}
-	block := strings.Join(env, "\x00") + "\x00\x00"
-	return windows.UTF16PtrFromString(block)
+
+	// Each entry is "KEY=VALUE" encoded as UTF-16, terminated by a null uint16.
+	// The block ends with an extra null uint16.
+	var block []uint16
+	for _, s := range env {
+		encoded, err := windows.UTF16FromString(s)
+		if err != nil {
+			return nil, fmt.Errorf("buildEnvBlock: encode %q: %w", s, err)
+		}
+		// UTF16FromString appends a null terminator already.
+		block = append(block, encoded...)
+	}
+	// Final double-null terminator (UTF16FromString already added one null per
+	// entry, so we just need one more to close the block).
+	block = append(block, 0)
+
+	return &block[0], nil
 }
 
 func utf16PtrOrNil(s string) (*uint16, error) {

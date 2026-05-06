@@ -46,7 +46,7 @@ func TestBridge_GetCPUCores(t *testing.T) {
 
 func TestBridge_GetRAM(t *testing.T) {
 	p := identity.Windows11DesktopTemplate()
-	p.Hardware.RAMMb = 8192 // 8 GB → deviceMemory = 4
+	p.Hardware.RAMMb = 8192 // 8 GB → deviceMemory buckets to 8
 	srv := newBridgeServer(t, p)
 
 	raw, err := srv.Call(context.Background(), messages.MethodHardwareGetRAM, nil)
@@ -58,8 +58,8 @@ func TestBridge_GetRAM(t *testing.T) {
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.DeviceMemoryGB != 4.0 {
-		t.Errorf("expected 4.0 GB device memory, got %v", resp.DeviceMemoryGB)
+	if resp.DeviceMemoryGB != 8.0 {
+		t.Errorf("expected 8.0 GB device memory, got %v", resp.DeviceMemoryGB)
 	}
 }
 

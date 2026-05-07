@@ -25,7 +25,7 @@ Write-Host "Building ghost-silicon v$Version ($CommitHash) for windows/amd64..."
 
 $env:GOOS   = "windows"
 $env:GOARCH = "amd64"
-$env:CGO_ENABLED = "0"
+$env:CGO_ENABLED = "1"
 
 go build -ldflags $LdFlags -o "$OutDir\ghost-silicon.exe" .\cmd\ghost-silicon
 

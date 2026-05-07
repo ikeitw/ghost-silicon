@@ -1,8 +1,28 @@
 // cmd/ghost-silicon/main.go
-// Ghost-Silicon — Windows 11 browser supervisor.
-// Entry point: loads config, bootstraps telemetry, wires all subsystems,
-// starts the IPC bridge, launches the renderer, and blocks until a signal.
+// Ghost-Silicon — Windows 11 privacy browser.
+//
+// Startup sequence (GUI mode, default):
+//  1. Parse CLI flags; auto-discover config if none is given.
+//  2. Bootstrap telemetry, run storage migrations.
+//  3. Load (or auto-generate) the active identity profile.
+//  4. Create the IPC bridge; start the named-pipe listener.
+//  5. Optionally start a secondary renderer process.
+//  6. Open the Walk browser window — blocks until the window closes.
+//  7. Graceful LIFO shutdown.
+//
+// Double-click behaviour:
+//  No -config flag is needed. The binary searches for ghost-silicon.yaml in:
+//    1. Next to the .exe  (bin\configs\ghost-silicon.yaml)
+//    2. One directory up  (configs\ghost-silicon.yaml — dev layout)
+//    3. %APPDATA%\ghost-silicon\ghost-silicon.yaml
+//  If none is found the built-in defaults are used (all paths go to APPDATA).
+//
+//  Any fatal error is shown as a Windows MessageBox AND written to
+//  %APPDATA%\ghost-silicon\crash.log so it is never silently swallowed.
+
 package main
+
+//go:generate windres -i resource.rc -o resource.syso -O coff
 
 import (
 	"context"
@@ -12,6 +32,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+
+	"golang.org/x/sys/windows"
 
 	"ghost-silicon/internal/app/bootstrap"
 	"ghost-silicon/internal/app/lifecycle"
@@ -23,6 +48,7 @@ import (
 	"ghost-silicon/internal/platform/windows/filesystem"
 	"ghost-silicon/internal/platform/windows/process"
 	"ghost-silicon/pkg/bridge"
+	"ghost-silicon/pkg/browser"
 	"ghost-silicon/pkg/identity"
 	"ghost-silicon/pkg/renderer"
 	"ghost-silicon/pkg/storage"
@@ -31,7 +57,7 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "ghost-silicon: fatal: %v\n", err)
+		showFatalError(err)
 		os.Exit(1)
 	}
 }
@@ -39,8 +65,9 @@ func main() {
 func run() error {
 	// ── CLI flags ────────────────────────────────────────────────────────
 	var (
-		configPath  = flag.String("config", "", "path to ghost-silicon.yaml")
+		configPath  = flag.String("config", "", "path to ghost-silicon.yaml (auto-discovered if empty)")
 		showVersion = flag.Bool("version", false, "print version and exit")
+		headless    = flag.Bool("headless", false, "supervisor-only mode, no GUI")
 	)
 	flag.Parse()
 
@@ -49,9 +76,15 @@ func run() error {
 		return nil
 	}
 
+	// ── Config discovery ─────────────────────────────────────────────────
+	resolvedConfig := *configPath
+	if resolvedConfig == "" {
+		resolvedConfig = discoverConfig()
+	}
+
 	// ── Bootstrap ────────────────────────────────────────────────────────
 	app, err := bootstrap.Run(bootstrap.Options{
-		ConfigPath: *configPath,
+		ConfigPath: resolvedConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
@@ -73,7 +106,11 @@ func run() error {
 	}
 
 	// ── Load or generate profile ─────────────────────────────────────────
-	activeProfile, err := resolveProfile(profileStore, cfg.Identity.DefaultProfile, cfg.Identity.AutoGenerate)
+	activeProfile, err := resolveProfile(
+		profileStore,
+		cfg.Identity.DefaultProfile,
+		cfg.Identity.AutoGenerate,
+	)
 	if err != nil {
 		return fmt.Errorf("resolve profile: %w", err)
 	}
@@ -99,41 +136,12 @@ func run() error {
 		return fmt.Errorf("pipe listener: %w", err)
 	}
 
-	// ── Adapter & runtime ────────────────────────────────────────────────
-	eng, err := adapter.Global.Get("mock", cfg.Engine.Executable)
-	if err != nil {
-		// Fall back to mock adapter when no engine is registered.
-		log.Warn("renderer adapter not found — using mock", "engine", cfg.Engine.Executable)
-		eng = adapter.NewMockAdapter()
-	}
-
-	rt := eruntime.New(eruntime.Options{
-		Adapter: eng,
-		Log:     log,
-		Auditor: auditor,
-		RestartPolicy: process.RestartPolicy{
-			MaxCrashes:   cfg.Engine.CrashRestartLimit,
-			InitialDelay: cfg.Engine.CrashRestartDelay,
-			MaxDelay:     cfg.Engine.CrashRestartDelay * 10,
-		},
-	})
-
-	startOpts := renderer.StartOptions{
-		ProfileID:   activeProfile.ID,
-		SessionID:   sessionID,
-		PipeName:    cfg.IPC.PipeName,
-		UserDataDir: layout.Root,
-		CacheDir:    layout.Cache,
-		ExtraArgs:   cfg.Engine.Args,
-	}
-
-	// ── Lifecycle ────────────────────────────────────────────────────────
+	// ── Lifecycle manager ─────────────────────────────────────────────────
 	lc := lifecycle.NewManager(log)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	defer cancel()
 
-	// IPC bridge hook
 	lc.OnStart("ipc-bridge", func(ctx context.Context) error {
 		go func() {
 			_ = pipeListener.Serve(ctx, func(conn net.Conn) {
@@ -146,22 +154,53 @@ func run() error {
 		return pipeListener.Close()
 	})
 
-	// Renderer hook
-	lc.OnStart("renderer", func(ctx context.Context) error {
-		go func() {
-			if err := rt.Start(ctx, startOpts); err != nil {
-				log.Error("renderer exited", "error", err.Error())
-			}
-		}()
-		return nil
-	})
-	lc.OnStop("renderer", func(_ context.Context) error {
-		return rt.Stop(cfg.App.ShutdownTimeout)
-	})
+	// ── Adapter & runtime (only when a separate renderer is configured) ──
+	// In GUI mode the embedded WebView2 IS the renderer.  Only start a
+	// secondary renderer process when engine.executable is explicitly set.
+	if cfg.Engine.Executable != "" {
+		eng, err := adapter.Global.Get("mock", cfg.Engine.Executable)
+		if err != nil {
+			log.Warn("renderer adapter not found — using mock", "engine", cfg.Engine.Executable)
+			eng = adapter.NewMockAdapter()
+		}
 
-	// ── Start ────────────────────────────────────────────────────────────
+		rt := eruntime.New(eruntime.Options{
+			Adapter: eng,
+			Log:     log,
+			Auditor: auditor,
+			RestartPolicy: process.RestartPolicy{
+				MaxCrashes:   cfg.Engine.CrashRestartLimit,
+				InitialDelay: cfg.Engine.CrashRestartDelay,
+				MaxDelay:     cfg.Engine.CrashRestartDelay * 10,
+			},
+		})
+
+		startOpts := renderer.StartOptions{
+			ProfileID:   activeProfile.ID,
+			SessionID:   sessionID,
+			PipeName:    cfg.IPC.PipeName,
+			UserDataDir: layout.Root,
+			CacheDir:    layout.Cache,
+			ExtraArgs:   cfg.Engine.Args,
+		}
+
+		lc.OnStart("renderer", func(ctx context.Context) error {
+			go func() {
+				if err := rt.Start(ctx, startOpts); err != nil {
+					log.Error("renderer exited", "error", err.Error())
+				}
+			}()
+			return nil
+		})
+		lc.OnStop("renderer", func(_ context.Context) error {
+			return rt.Stop(cfg.App.ShutdownTimeout)
+		})
+	} else {
+		log.Info("renderer: using embedded WebView2 — no separate process")
+	}
+
+	// ── Start all subsystems ─────────────────────────────────────────────
 	if err := lc.Start(ctx); err != nil {
-		cancel()
 		return fmt.Errorf("startup: %w", err)
 	}
 
@@ -169,45 +208,136 @@ func run() error {
 		"session_id", sessionID,
 		"pipe", cfg.IPC.PipeName,
 		"version", version.Version,
+		"headless", *headless,
+		"config", resolvedConfig,
 	)
 
-	// ── Wait for OS signal ───────────────────────────────────────────────
-	shutHandler := shutdown.NewHandler(cfg.App.ShutdownTimeout, log)
+	// ── HEADLESS MODE ─────────────────────────────────────────────────────
+	if *headless {
+		done := make(chan struct{})
+		shutHandler := shutdown.NewHandler(cfg.App.ShutdownTimeout, log)
+		go func() {
+			defer close(done)
+			shutCtx, shutCancel := context.WithTimeout(
+				context.Background(), cfg.App.ShutdownTimeout)
+			defer shutCancel()
+			_ = lc.Stop(shutCtx)
+		}()
+		shutHandler.WaitForSignal(cancel, done)
+		return nil
+	}
+
+	// ── GUI MODE ──────────────────────────────────────────────────────────
+	win, err := browser.NewWindow(browser.WindowOptions{
+		Bridge:      br,
+		UserDataDir: layout.Root,
+		PipeName:    cfg.IPC.PipeName,
+		Log:         log,
+	})
+	if err != nil {
+		return fmt.Errorf("browser window create: %w", err)
+	}
+
+	winDone := make(chan struct{})
 	go func() {
-		defer close(done)
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), cfg.App.ShutdownTimeout)
-		defer shutCancel()
-		_ = lc.Stop(shutCtx)
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
+		select {
+		case sig := <-sigCh:
+			log.Info("signal received — closing window", "signal", sig.String())
+			win.Close()
+			cancel()
+		case <-winDone:
+		}
 	}()
 
-	shutHandler.WaitForSignal(cancel, done)
+	if err := win.Open(); err != nil {
+		return fmt.Errorf("browser window: %w", err)
+	}
+
+	close(winDone)
+	cancel()
+
+	log.Info("browser window closed — shutting down subsystems")
+	shutCtx, shutCancel := context.WithTimeout(
+		context.Background(), cfg.App.ShutdownTimeout)
+	defer shutCancel()
+	_ = lc.Stop(shutCtx)
+
 	return nil
 }
 
-// resolveProfile loads the configured default profile, or the first available
-// profile, or auto-generates one if AutoGenerate is set.
-func resolveProfile(store *storage.ProfileStore, defaultID string, autoGenerate bool) (*identity.Profile, error) {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// discoverConfig searches well-known locations for ghost-silicon.yaml so the
+// binary works when double-clicked without any CLI arguments.
+func discoverConfig() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exeDir := filepath.Dir(exePath)
+
+	candidates := []string{
+		filepath.Join(exeDir, "configs", "ghost-silicon.yaml"),                     // next to exe
+		filepath.Join(exeDir, "..", "configs", "ghost-silicon.yaml"),               // dev layout
+		filepath.Join(os.Getenv("APPDATA"), "ghost-silicon", "ghost-silicon.yaml"), // installed
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return "" // loader falls back to built-in defaults
+}
+
+// showFatalError shows a Windows MessageBox with the error message (visible
+// when double-clicking with no console) and writes a crash.log to APPDATA.
+func showFatalError(err error) {
+	msg := fmt.Sprintf(
+		"Ghost-Silicon failed to start:\n\n%v\n\nA crash log has been written to:\n%%APPDATA%%\\ghost-silicon\\crash.log",
+		err,
+	)
+
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		logDir := filepath.Join(appData, "ghost-silicon")
+		_ = os.MkdirAll(logDir, 0o700)
+		_ = os.WriteFile(filepath.Join(logDir, "crash.log"), []byte(msg+"\n"), 0o600)
+	}
+
+	title, _ := windows.UTF16PtrFromString("Ghost-Silicon — Startup Error")
+	text, _ := windows.UTF16PtrFromString(msg)
+	_, _ = windows.MessageBox(0, text, title, windows.MB_ICONERROR|windows.MB_OK)
+}
+
+// resolveProfile loads the default profile, the first available profile,
+// or auto-generates one when AutoGenerate is true.
+func resolveProfile(
+	store *storage.ProfileStore,
+	defaultID string,
+	autoGenerate bool,
+) (*identity.Profile, error) {
 	if defaultID != "" {
-		p, err := store.Load(defaultID)
-		if err == nil {
+		if p, err := store.Load(defaultID); err == nil {
 			return p, nil
 		}
 	}
-	metas, err := store.List()
-	if err == nil && len(metas) > 0 {
+	if metas, err := store.List(); err == nil && len(metas) > 0 {
 		return store.Load(metas[0].ID)
 	}
 	if autoGenerate {
 		p := identity.Windows11DesktopTemplate()
 		if saveErr := store.Save(p); saveErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not save auto-generated profile: %v\n", saveErr)
+			fmt.Fprintf(os.Stderr,
+				"warning: could not save auto-generated profile: %v\n", saveErr)
 		}
 		return p, nil
 	}
 	return nil, fmt.Errorf("no profiles found and auto_generate is disabled")
 }
 
-// newSessionID generates a cryptographically random 16-byte hex session ID.
+// newSessionID returns a cryptographically random 16-byte hex session ID.
 func newSessionID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

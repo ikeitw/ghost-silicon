@@ -75,9 +75,9 @@ func validateApp(a *schema.AppConfig, r *Result) {
 }
 
 func validateEngine(e *schema.EngineConfig, r *Result) {
-	if strings.TrimSpace(e.Executable) == "" {
-		r.add("engine.executable", "must not be empty — set the path to your renderer binary")
-	}
+	// engine.executable is optional when using the embedded WebView2 renderer
+	// (the default GUI mode).  Set it only to attach a separate renderer process
+	// over the named pipe.
 	if e.StartTimeout <= 0 {
 		r.add("engine.start_timeout", "must be > 0")
 	}

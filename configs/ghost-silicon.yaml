@@ -4,11 +4,12 @@
 
 app:
   name: ghost-silicon
-  data_dir: ""          # empty = %APPDATA%\ghost-silicon on Windows
+  data_dir: ""          # empty = %APPDATA%\ghost-silicon on Windows (resolved automatically)
   shutdown_timeout: 15s
 
 engine:
-  executable: ""        # required: full path to your renderer binary
+  executable: ""        # empty = use the embedded WebView2 renderer (default, recommended)
+  # set to a full path only to attach a separate renderer process
   args: []
   start_timeout: 30s
   crash_restart_limit: 3
@@ -43,7 +44,7 @@ sandbox:
   cpu_rate_percent: 0       # 0 = unlimited
 
 ipc:
-  pipe_name: "\\\\.\\ pipe\\ghost-silicon-bridge"
+  pipe_name: "\\\\.\\pipe\\ghost-silicon-bridge"
   enable_websocket: false
   websocket_addr: "127.0.0.1:9222"
   read_timeout: 10s

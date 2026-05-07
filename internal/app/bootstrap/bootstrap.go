@@ -40,6 +40,20 @@ func Run(opts Options) (*App, error) {
 		}
 	}
 
+	// ── 1b. Resolve DataDir before validation ───────────────────────────
+	// The YAML config may set data_dir: "" (or omit it) to mean "use the
+	// platform default".  We must expand it here — before step 2 — because
+	// validation rejects an empty DataDir and step 4 (path resolution for
+	// ProfileDir / BaseDir) depends on DataDir being set first.
+	if cfg.App.DataDir == "" {
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			cfg.App.DataDir = filepath.Join(appData, "ghost-silicon")
+		} else {
+			home, _ := os.UserHomeDir()
+			cfg.App.DataDir = filepath.Join(home, ".ghost-silicon")
+		}
+	}
+
 	// ── 2. Validate configuration ────────────────────────────────────────
 	result := validation.Validate(cfg)
 	if !result.Valid() {

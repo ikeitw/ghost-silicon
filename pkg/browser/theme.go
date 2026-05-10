@@ -25,34 +25,36 @@ const (
 	PaddingL      = 16  // px — large gap
 )
 
-// ── Dark-theme colour palette ─────────────────────────────────────────────────
+// ── Light-theme colour palette ────────────────────────────────────────────────
+// The toolbar and tab strip are Walk Win32 widgets sitting above WebView2.
+// Using light colours makes them clearly distinct from the white page content.
 
 var (
 	// Structural
-	ColorBackground    = walk.RGB(18, 18, 21) // main window fill
-	ColorSurface       = walk.RGB(27, 27, 32) // toolbar / tab-bar bg
-	ColorSurfaceRaised = walk.RGB(38, 38, 46) // active tab / input field
-	ColorBorder        = walk.RGB(52, 52, 62) // hairline borders
+	ColorBackground    = walk.RGB(248, 248, 250) // main window fill
+	ColorSurface       = walk.RGB(237, 238, 242) // toolbar / tab-bar bg
+	ColorSurfaceRaised = walk.RGB(255, 255, 255) // active tab / input field
+	ColorBorder        = walk.RGB(210, 210, 218) // hairline borders
 
 	// Interactive
-	ColorAccent    = walk.RGB(99, 148, 237) // cornflower-blue primary action
-	ColorAccentDim = walk.RGB(60, 92, 160)  // pressed / secondary action
-	ColorHover     = walk.RGB(46, 46, 56)   // button hover fill
-	ColorActive    = walk.RGB(60, 60, 72)   // button pressed fill
+	ColorAccent    = walk.RGB(66, 133, 244)  // Google-blue primary action
+	ColorAccentDim = walk.RGB(30, 90, 190)   // pressed / secondary action
+	ColorHover     = walk.RGB(220, 222, 228) // button hover fill
+	ColorActive    = walk.RGB(200, 202, 210) // button pressed fill
 
 	// Text
-	ColorText      = walk.RGB(228, 228, 234) // primary body text
-	ColorTextMuted = walk.RGB(138, 138, 154) // secondary / placeholder
-	ColorTextURL   = walk.RGB(128, 198, 128) // URL in address bar
+	ColorText      = walk.RGB(25, 25, 35)    // primary body text
+	ColorTextMuted = walk.RGB(110, 110, 125) // secondary / placeholder
+	ColorTextURL   = walk.RGB(20, 120, 40)   // URL in address bar
 
 	// Semantic
-	ColorDanger      = walk.RGB(218, 68, 68)  // close-tab hover, error
-	ColorSecureURL   = walk.RGB(96, 196, 128) // https: lock indicator
-	ColorInsecureURL = walk.RGB(218, 118, 78) // http: indicator
-	ColorProfileDot  = walk.RGB(78, 178, 118) // profile badge dot
+	ColorDanger      = walk.RGB(200, 50, 50) // close-tab hover, error
+	ColorSecureURL   = walk.RGB(30, 130, 60) // https: lock indicator
+	ColorInsecureURL = walk.RGB(180, 80, 20) // http: indicator
+	ColorProfileDot  = walk.RGB(50, 150, 90) // profile badge dot
 
-	// Per-session glow (same hue as accent; caller may vary saturation)
-	ColorSessionAccent = walk.RGB(99, 148, 237)
+	// Per-session accent
+	ColorSessionAccent = walk.RGB(66, 133, 244)
 )
 
 // ── Fonts (lazy-initialised) ──────────────────────────────────────────────────

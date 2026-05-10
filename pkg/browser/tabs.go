@@ -77,7 +77,11 @@ func NewTabStrip(parent walk.Container) (*TabStrip, error) {
 	return ts, nil
 }
 
-// AddTab appends a new tab (thread-safe) and triggers a repaint.
+// Handle returns the Win32 HWND of the tab strip widget.
+// Used by Window to manually position the strip via SetWindowPos.
+func (ts *TabStrip) Handle() win.HWND {
+	return win.HWND(uintptr(ts.widget.Handle()))
+}
 func (ts *TabStrip) AddTab(url, title string) string {
 	ts.mu.Lock()
 	id := ts.addTabLocked(url, title)
@@ -215,10 +219,10 @@ func (ts *TabStrip) paint(canvas *walk.Canvas, updateBounds walk.Rectangle) erro
 			tabBrush.Dispose()
 		}
 
-		// Active tab: cornflower accent line along the top edge.
+		// Active tab: blue accent line along the top edge.
 		if isActive {
 			if accentBrush, aErr := walk.NewSolidColorBrush(ColorAccent); aErr == nil {
-				canvas.FillRectangle(accentBrush, walk.Rectangle{X: x, Y: y, Width: w, Height: 2})
+				canvas.FillRectangle(accentBrush, walk.Rectangle{X: x, Y: y, Width: w, Height: 3})
 				accentBrush.Dispose()
 			}
 		}

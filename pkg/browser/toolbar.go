@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 )
 
 // Toolbar groups the Walk controls that make up the browser chrome row.
@@ -191,7 +192,11 @@ func NewToolbar(parent walk.Container) (*Toolbar, error) {
 	return tb, nil
 }
 
-// SetURL updates the address bar text.
+// Handle returns the Win32 HWND of the toolbar composite.
+// Used by Window to manually position the toolbar via SetWindowPos.
+func (tb *Toolbar) Handle() win.HWND {
+	return win.HWND(uintptr(tb.composite.Handle()))
+}
 func (tb *Toolbar) SetURL(url string) {
 	_ = tb.addrBar.SetText(url)
 	tb.updateSecureIndicator(url)

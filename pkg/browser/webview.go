@@ -5,16 +5,17 @@
 //
 // Architecture (HTML chrome):
 //
-//	Walk MainWindow (full client area)
+//	go-webview2 top-level window (frameless, subclassed WndProc)
 //	└── WebView2 controller (fills entire client area)
 //	    └── HTML chrome overlay (position:fixed, z-index max)
 //	        — address bar, nav buttons, tab strip — all rendered as HTML
 //
 // The browser chrome (toolbar, tabs, address bar) is implemented as a
 // position:fixed HTML overlay injected into every page via
-// AddScriptToExecuteOnDocumentCreated.  This eliminates the Win32
-// child-window Z-order / WndProc conflicts that prevented the Walk-based
-// toolbar from rendering.
+// AddScriptToExecuteOnDocumentCreated.  Tab state is persisted in Go so it
+// survives page navigations.  Window resize is handled via JS edge detection
+// because WebView2's child HWND covers the entire frame, preventing the
+// WndProc WM_NCHITTEST handler from receiving border mouse events.
 package browser
 
 import (
@@ -48,6 +49,7 @@ type WebViewPanel struct {
 	userDataDir string
 
 	wndProcCb uintptr // keeps subclassed WndProc callback alive (GC guard)
+	tabsJSON  string  // JSON tab state persisted across navigations
 
 	// Callbacks set by Window after construction.
 	OnTitleChange  func(title string)
@@ -78,6 +80,11 @@ func NewWebViewPanel(
 		Debug:     false,
 		DataPath:  userDataDir,
 		AutoFocus: true,
+		WindowOptions: webview2.WindowOptions{
+			Width:  defaultWindowW,
+			Height: defaultWindowH,
+			Center: true,
+		},
 	})
 	if wv == nil {
 		return nil, fmt.Errorf("webview2: failed to create instance — " +
@@ -92,8 +99,7 @@ func NewWebViewPanel(
 	//   • WM_NCCALCSIZE: return 0 so the entire window rect is client area,
 	//     eliminating the non-client border strip completely.
 	//   • WM_NCHITTEST: return resize hit-values for the 8-px edge zone;
-	//     return HTCLIENT for everything else so mouse events reach WebView2,
-	//     which handles tab-bar dragging internally via -webkit-app-region:drag.
+	//     return HTCLIENT for everything else so mouse events reach WebView2.
 	// DwmSetWindowAttribute restores the DWM shadow and Windows 11 rounded
 	// corners that WS_CAPTION removal would otherwise kill.
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
@@ -103,21 +109,15 @@ func NewWebViewPanel(
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
 	p.subclassFrameless(wvHWND)
 	dwmapi := syscall.NewLazyDLL("dwmapi.dll")
-	// Restore DWM shadow (disabled when WS_CAPTION is removed).
-	ncPolicy := uint32(2) // DWMNCRP_ENABLED
+	ncPolicy := uint32(2) // DWMNCRP_ENABLED — restore DWM shadow
 	dwmapi.NewProc("DwmSetWindowAttribute").Call(
 		uintptr(wvHWND), 2, uintptr(unsafe.Pointer(&ncPolicy)), 4)
-	// Windows 11: keep rounded corners.
-	cornerPref := uint32(2) // DWMWCP_ROUND
+	cornerPref := uint32(2) // DWMWCP_ROUND — Windows 11 rounded corners
 	dwmapi.NewProc("DwmSetWindowAttribute").Call(
 		uintptr(wvHWND), 33, uintptr(unsafe.Pointer(&cornerPref)), 4)
 
 	// ── Window management bindings ────────────────────────────────────────
-	// go-webview2 always creates its own top-level window regardless of the
-	// Window option passed to NewWithOptions.  wv.Window() is that window's
-	// HWND — the one the user actually sees and interacts with.  All min/max/
-	// close operations must target it, not Walk's MainWindow HWND.
-	const swMaximize = 3 // SW_SHOWMAXIMIZED — used to detect current state
+	const swMaximize = 3 // SW_SHOWMAXIMIZED
 
 	p.wv.Bind("__ghostMinimize", func() {
 		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
@@ -142,15 +142,41 @@ func NewWebViewPanel(
 		win.ReleaseCapture()
 		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, win.HTCAPTION, lp)
 	})
+	p.wv.Bind("__ghostIsMaximized", func() bool {
+		var wp win.WINDOWPLACEMENT
+		wp.Length = uint32(unsafe.Sizeof(wp))
+		win.GetWindowPlacement(wvHWND, &wp)
+		return wp.ShowCmd == swMaximize
+	})
+	// Tab state — persisted in Go so it survives page navigations.
+	p.tabsJSON = `{"tabs":[{"id":1,"url":"ghost://newtab","title":"New Tab"}],"current":1}`
+	p.wv.Bind("__ghostGetTabs", func() string {
+		return p.tabsJSON
+	})
+	p.wv.Bind("__ghostSetTabs", func(json string) {
+		p.tabsJSON = json
+	})
+	// Resize — WebView2's child HWND covers the entire frame, so WM_NCHITTEST
+	// in the host WndProc never fires for border regions.  The JS overlay
+	// detects cursor proximity to viewport edges and calls this binding to
+	// start a native resize via WM_NCLBUTTONDOWN.
+	p.wv.Bind("__ghostStartResize", func(ht int) {
+		var pt win.POINT
+		win.GetCursorPos(&pt)
+		lp := uintptr(pt.Y)<<16 | uintptr(uint16(pt.X))
+		win.ReleaseCapture()
+		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, uintptr(ht), lp)
+	})
 
 	if err := p.injectPolyfill(); err != nil {
 		p.log.Warn("polyfill injection failed", "error", err.Error())
 	}
 	p.injectChromeOverlay()
+	p.injectResizeEdges()
+	p.injectKeyboardShortcuts()
 	p.bindEventBridge()
 	p.wv.Bind("__ghostNavigate", p.handleGhostScheme)
 
-	mw.SizeChanged().Attach(p.onResize)
 	return p, nil
 }
 
@@ -219,132 +245,312 @@ func (p *WebViewPanel) UpdateProfile() {
 
 // ── HTML chrome overlay ───────────────────────────────────────────────────────
 
-// injectChromeOverlay injects a position:fixed browser chrome into every
-// page via AddScriptToExecuteOnDocumentCreated.  The overlay contains the
-// address bar, navigation buttons, and a single-tab strip.
+// injectChromeOverlay injects a position:fixed browser chrome into every page
+// (including ghost:// data: pages) via AddScriptToExecuteOnDocumentCreated.
+// The overlay manages a real multi-tab strip backed by Go-side persisted state.
 //
-// Ghost:// internal pages (served as data: URLs) skip the overlay because
-// they include the chrome in their own HTML.
+// Robustness design: event listeners are attached directly to the bar element
+// once (they persist through DOM removal/re-insertion). mount() only handles
+// DOM insertion. A 500 ms heartbeat re-inserts the toolbar if a page's JS
+// removes it (e.g. YouTube SPA hydration).
 func (p *WebViewPanel) injectChromeOverlay() {
 	profileName := p.br.Profile().Name
 
-	// %q embeds the profile name safely; %% produces a literal % in CSS.
+	// %q embeds the profile name safely.
+	// CSS percent signs must be written as %% so fmt.Sprintf passes them through.
 	script := fmt.Sprintf(`(function(){
 'use strict';
-if(window.location.href.startsWith('data:')||window.location.href==='about:blank')return;
-if(document.getElementById('_gs_toolbar'))return;
-var CHROME_H=82;
-var profile=%q;
-var styleEl=document.createElement('style');
-styleEl.textContent=[
-  '#_gs_toolbar{position:fixed;top:0;left:0;right:0;height:'+CHROME_H+'px;',
-  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);',
-  'border-bottom:1px solid rgba(255,255,255,.1);z-index:2147483647;',
-  'display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5);}',
-  '#_gs_tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:2px;',
-  '-webkit-app-region:drag;}',  /* drag the window by the tab bar background */
-  /* interactive children must opt out of dragging */
-  '#_gs_tab,#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag;}',
-  '#_gs_tab{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.2);',
-  'border-bottom:none;border-radius:8px 8px 0 0;padding:0 12px;height:30px;',
-  'display:flex;align-items:center;font-size:12px;color:white;',
-  'max-width:220px;white-space:nowrap;overflow:hidden;}',
-  '#_gs_tab_title{overflow:hidden;text-overflow:ellipsis;flex:1;}',
-  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.6);',
-  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%;align-self:center;line-height:1;}',
-  '#_gs_new_tab:hover{background:rgba(255,255,255,.15);color:white;}',
-  '#_gs_nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px;}',
-  '._gs_btn{width:28px;height:28px;border:none;background:transparent;',
-  'border-radius:50%%;cursor:pointer;font-size:16px;color:rgba(255,255,255,.8);',
-  'display:flex;align-items:center;justify-content:center;}',
-  '._gs_btn:hover{background:rgba(255,255,255,.15);color:white;}',
-  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);',
-  'border-radius:15px;padding:0 14px;font-size:13px;',
-  'background:rgba(255,255,255,.12);color:white;outline:none;}',
-  '#_gs_addr::placeholder{color:rgba(255,255,255,.4);}',
-  '#_gs_addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18);}',
-  '#_gs_badge{width:10px;height:10px;border-radius:50%%;background:#F4A460;',
-  'flex-shrink:0;box-shadow:0 0 4px rgba(244,164,96,.6);}',
-  /* Window control buttons (close / maximise / minimise) */
-  '#_gs_wm_btns{display:flex;align-items:stretch;margin-left:auto;height:38px;-webkit-app-region:no-drag;}',
-  '._gs_wm_btn{width:46px;height:100%%;border:none;background:transparent;',
-  'color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;',
-  'display:flex;align-items:center;justify-content:center;}',
-  '._gs_wm_btn:hover{background:rgba(255,255,255,.2);}',
-  '#_gs_cls:hover{background:#E81123!important;color:#fff;}',
-  'body{padding-top:'+CHROME_H+'px!important;}'
-].join('');
+try{if(window!==window.top)return;}catch(e){return;}
+var H=82,profile=%q;
+
+/* ── Style element ──────────────────────────────────────────── */
+var s=document.createElement('style');
+s.id='_gs_st';
+s.textContent=
+  '#_gs_toolbar{position:fixed;top:0;left:0;right:0;height:'+H+'px;'+
+  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
+  'border-bottom:1px solid rgba(255,255,255,.1);z-index:2147483647;'+
+  'display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5)}'+
+  '#_gs_tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:0;'+
+  'overflow:hidden;-webkit-app-region:drag}'+
+  '#_gs_tablist{display:flex;align-items:flex-end;gap:2px;overflow:hidden;flex:1;min-width:0}'+
+  '#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag}'+
+  '._gst{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.15);border-bottom:none;'+
+  'border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex;align-items:center;'+
+  'font-size:12px;color:rgba(255,255,255,.75);max-width:180px;min-width:80px;cursor:pointer;'+
+  '-webkit-app-region:no-drag;flex-shrink:0}'+
+  '._gst._gst_a{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.25)}'+
+  '._gst:hover{background:rgba(255,255,255,.16)}'+
+  '._gst>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}'+
+  '._gst_x{background:transparent;border:none;color:rgba(255,255,255,.4);font-size:11px;'+
+  'cursor:pointer;padding:0 3px;margin-left:2px;border-radius:3px;flex-shrink:0;line-height:1.5}'+
+  '._gst_x:hover{background:rgba(255,255,255,.2);color:#fff}'+
+  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.6);'+
+  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%%;align-self:center;line-height:1;flex-shrink:0}'+
+  '#_gs_new_tab:hover{background:rgba(255,255,255,.15);color:#fff}'+
+  '#_gs_nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}'+
+  '._gs_btn{width:28px;height:28px;border:none;background:transparent;border-radius:50%%;cursor:pointer;'+
+  'font-size:16px;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center}'+
+  '._gs_btn:hover{background:rgba(255,255,255,.15);color:#fff}'+
+  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);border-radius:15px;'+
+  'padding:0 14px;font-size:13px;background:rgba(255,255,255,.12);color:#fff;outline:none}'+
+  '#_gs_addr::placeholder{color:rgba(255,255,255,.4)}'+
+  '#_gs_addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18)}'+
+  '#_gs_badge{width:10px;height:10px;border-radius:50%%;background:#F4A460;'+
+  'flex-shrink:0;box-shadow:0 0 4px rgba(244,164,96,.6)}'+
+  '#_gs_wm_btns{display:flex;align-items:stretch;margin-left:auto;height:38px;-webkit-app-region:no-drag}'+
+  '._gs_wm_btn{width:46px;height:100%%;border:none;background:transparent;'+
+  'color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;'+
+  'display:flex;align-items:center;justify-content:center}'+
+  '._gs_wm_btn:hover{background:rgba(255,255,255,.2)}'+
+  '#_gs_cls:hover{background:#E81123!important;color:#fff}'+
+  'body{padding-top:'+H+'px!important}';
+
+/* ── Toolbar element ────────────────────────────────────────── */
 var bar=document.createElement('div');
 bar.id='_gs_toolbar';
 bar.innerHTML=
-  '<div id="_gs_tabs">'+
-    '<div id="_gs_tab"><span id="_gs_tab_title">Loading\u2026</span></div>'+
-    '<button id="_gs_new_tab" title="New Tab">+</button>'+
-    '<div id="_gs_wm_btns">'+
-      '<button class="_gs_wm_btn" id="_gs_min" title="Minimise">&#8212;</button>'+
-      '<button class="_gs_wm_btn" id="_gs_max" title="Maximise">&#9633;</button>'+
-      '<button class="_gs_wm_btn" id="_gs_cls" title="Close">&#10005;</button>'+
-    '</div>'+
+  '<div id="_gs_tabs"><div id="_gs_tablist">'+
+  '<div class="_gst _gst_a"><span id="_gs_tab_title">Loading…</span>'+
+  '<button class="_gst_x" style="display:none">&#10005;</button></div>'+
   '</div>'+
+  '<button id="_gs_new_tab" title="New Tab (Ctrl+T)">+</button>'+
+  '<div id="_gs_wm_btns">'+
+  '<button class="_gs_wm_btn" id="_gs_min" title="Minimise">&#8212;</button>'+
+  '<button class="_gs_wm_btn" id="_gs_max" title="Maximise">&#9633;</button>'+
+  '<button class="_gs_wm_btn" id="_gs_cls" title="Close">&#10005;</button>'+
+  '</div></div>'+
   '<div id="_gs_nav">'+
-    '<button class="_gs_btn" id="_gs_back" title="Back">&#8592;</button>'+
-    '<button class="_gs_btn" id="_gs_fwd" title="Forward">&#8594;</button>'+
-    '<button class="_gs_btn" id="_gs_reload" title="Reload">&#8635;</button>'+
-    '<input id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>'+
-    '<div id="_gs_badge" title="Profile: '+profile+'"></div>'+
-  '</div>';
-function mount(){
-  if(document.getElementById('_gs_toolbar'))return;
-  document.head.appendChild(styleEl);
-  document.body.insertAdjacentElement('afterbegin',bar);
-  var addr=document.getElementById('_gs_addr');
-  addr.value=location.href;
-  function updateTitle(){
-    var t=document.getElementById('_gs_tab_title');
-    if(t)t.textContent=document.title||location.hostname||'New Tab';
+  '<button class="_gs_btn" id="_gs_back" title="Back">&#8592;</button>'+
+  '<button class="_gs_btn" id="_gs_fwd" title="Forward">&#8594;</button>'+
+  '<button class="_gs_btn" id="_gs_reload" title="Reload">&#8635;</button>'+
+  '<input id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>'+
+  '<div id="_gs_badge" title="Profile: '+profile+'"></div></div>';
+/* Apply critical layout styles directly — bypasses any page Content-Security-Policy
+   that might block our <style> element injection. */
+bar.style.cssText=
+  'position:fixed;top:0;left:0;right:0;'+
+  'height:'+H+'px;z-index:2147483647;'+
+  'display:flex;flex-direction:column;'+
+  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
+  'border-bottom:1px solid rgba(255,255,255,.1);box-shadow:0 2px 12px rgba(0,0,0,.5)';
+
+/* ── Direct element refs from bar (valid even when bar is detached) ── */
+var _tablist=bar.querySelector('#_gs_tablist');
+var _addr=bar.querySelector('#_gs_addr');
+var _tabTitle=bar.querySelector('#_gs_tab_title');
+
+/* ── Tab state ──────────────────────────────────────────────── */
+var _T={tabs:[],current:0};
+function _url(){return window.__ghostPageURL||location.href;}
+function _load(cb){
+  try{__ghostGetTabs().then(function(j){
+    try{_T=JSON.parse(j);}catch(_){_T=null;}
+    if(!_T||!_T.tabs||!_T.tabs.length){_T={tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};}
+    if(cb)cb();
+  });}catch(e){
+    if(!_T||!_T.tabs||!_T.tabs.length){_T={tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};}
+    if(cb)cb();
   }
-  updateTitle();
-  new MutationObserver(updateTitle).observe(document.querySelector('title')||document.head,{childList:true,characterData:true,subtree:true});
-  document.getElementById('_gs_tabs').addEventListener('mousedown',function(e){
-    if(e.button===0&&!e.target.closest('button,input,a')){try{__ghostStartDrag();}catch(_){}}
-  });
-  document.getElementById('_gs_back').addEventListener('click',function(){history.back();});
-  document.getElementById('_gs_fwd').addEventListener('click',function(){history.forward();});
-  document.getElementById('_gs_reload').addEventListener('click',function(){location.reload();});
-  document.getElementById('_gs_min').addEventListener('click',function(){try{__ghostMinimize();}catch(e){}});
-  document.getElementById('_gs_max').addEventListener('click',function(){try{__ghostMaximize();}catch(e){}});
-  document.getElementById('_gs_cls').addEventListener('click',function(){try{__ghostClose();}catch(e){}});
-  addr.addEventListener('keydown',function(e){
-    if(e.key!=='Enter')return;
-    e.preventDefault();
-    var raw=addr.value.trim();if(!raw)return;
-    var url=raw;
-    if(!url.match(/^https?:\/\//i)&&!url.startsWith('ghost://')){
-      if(url.indexOf('.')>=0&&url.indexOf(' ')<0){url='https://'+url;}
-      else{url='https://search.brave.com/search?q='+encodeURIComponent(url);}
-    }
-    location.href=url;
-  });
-  addr.addEventListener('focus',function(){addr.select();});
-  window.addEventListener('load',function(){addr.value=location.href;updateTitle();});
-  window.addEventListener('popstate',function(){addr.value=location.href;});
-  // New tab navigates the current page (single WebView2 instance)
-  document.getElementById('_gs_new_tab').addEventListener('click',function(){
-    location.href='ghost://newtab';
+}
+function _save(){try{__ghostSetTabs(JSON.stringify(_T));}catch(_){}}
+function _render(){
+  if(!_T.tabs||!_T.tabs.length)return;
+  _tablist.innerHTML='';
+  _T.tabs.forEach(function(t){
+    var el=document.createElement('div');
+    el.className=t.id===_T.current?'_gst _gst_a':'_gst';
+    var sp=document.createElement('span');sp.textContent=t.title||'New Tab';sp.title=t.title||'';
+    var xb=document.createElement('button');xb.className='_gst_x';xb.innerHTML='&#10005;';xb.title='Close';
+    el.appendChild(sp);el.appendChild(xb);
+    (function(id){
+      el.addEventListener('click',function(e){if(xb.contains(e.target))return;_switchTab(id);});
+      xb.addEventListener('click',function(e){e.stopPropagation();_closeTab(id);});
+    })(t.id);
+    _tablist.appendChild(el);
   });
 }
+function _updateCur(){
+  var u=_url(),ti=document.title||location.hostname||'New Tab';
+  for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===_T.current){_T.tabs[i].url=u;_T.tabs[i].title=ti;break;}}
+}
+function _switchTab(id){
+  _updateCur();_T.current=id;_save();
+  for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){location.href=_T.tabs[i].url;return;}}
+}
+window._gsNewTab=function(){
+  _updateCur();
+  var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
+  var id=mx+1;_T.tabs.push({id:id,url:'ghost://newtab',title:'New Tab'});
+  _T.current=id;_save();location.href='ghost://newtab';
+};
+window._gsCloseCurrentTab=function(){_closeTab(_T.current);};
+function _closeTab(id){
+  if(_T.tabs.length<=1){try{__ghostClose();}catch(_){}return;}
+  var idx=-1;for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){idx=i;break;}}
+  if(idx<0)return;
+  var wa=(id===_T.current);
+  _T.tabs.splice(idx,1);
+  if(wa){var ni=Math.min(idx,_T.tabs.length-1);_T.current=_T.tabs[ni].id;_save();location.href=_T.tabs[ni].url;}
+  else{_save();_render();}
+}
+
+/* ── Wire all event listeners onto bar elements once ────────── */
+/* These survive DOM removal/re-insertion since they live on the element. */
+function _mx(){
+  var b=bar.querySelector('#_gs_max');if(!b)return;
+  try{__ghostIsMaximized().then(function(m){
+    b.innerHTML=m?'❐':'□';b.title=m?'Restore':'Maximise';
+  });}catch(_){}
+}
+_mx();
+window.addEventListener('resize',_mx);
+bar.querySelector('#_gs_tabs').addEventListener('mousedown',function(e){
+  if(e.button===0&&!e.target.closest('button,input,a,._gst')){try{__ghostStartDrag();}catch(_){}}
+});
+bar.querySelector('#_gs_back').addEventListener('click',function(){history.back();});
+bar.querySelector('#_gs_fwd').addEventListener('click',function(){history.forward();});
+bar.querySelector('#_gs_reload').addEventListener('click',function(){location.reload();});
+bar.querySelector('#_gs_new_tab').addEventListener('click',function(){_gsNewTab();});
+bar.querySelector('#_gs_min').addEventListener('click',function(){try{__ghostMinimize();}catch(e){}});
+bar.querySelector('#_gs_max').addEventListener('click',function(){_mx();try{__ghostMaximize();}catch(e){}});
+bar.querySelector('#_gs_cls').addEventListener('click',function(){try{__ghostClose();}catch(e){}});
+_addr.addEventListener('keydown',function(e){
+  if(e.key!=='Enter')return;e.preventDefault();
+  var r=_addr.value.trim();if(!r)return;var u=r;
+  if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){
+    if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}
+    else{u='https://duckduckgo.com/?q='+encodeURIComponent(u);}
+  }
+  location.href=u;
+});
+_addr.addEventListener('focus',function(){_addr.select();});
+
+/* ── Title watcher (set up once) ────────────────────────────── */
+var _titleWatched=false;
+function _watchTitle(){
+  if(_titleWatched)return;_titleWatched=true;
+  var t=document.querySelector('title');
+  if(t){new MutationObserver(function(){_updateCur();_render();_save();})
+    .observe(t,{childList:true,characterData:true,subtree:true});}
+}
+
+/* ── Mount: only DOM insertion + one-time state init ────────── */
+var _ready=false;
+function mount(){
+  if(!document.documentElement)return;
+  /* Ensure style is in <head> (supplements inline styles with hover/focus rules). */
+  if(!document.getElementById('_gs_st')){
+    try{if(document.head)document.head.appendChild(s);}catch(_){}
+  }
+  /* Always re-assert critical inline styles — if the page reset them. */
+  bar.style.setProperty('position','fixed','important');
+  bar.style.setProperty('top','0','important');
+  bar.style.setProperty('left','0','important');
+  bar.style.setProperty('right','0','important');
+  bar.style.setProperty('height',H+'px','important');
+  bar.style.setProperty('z-index','2147483647','important');
+  bar.style.setProperty('display','flex','important');
+  bar.style.setProperty('flex-direction','column','important');
+  /* Body padding via inline JS — bypasses page CSP and any author !important. */
+  try{
+    if(document.body)document.body.style.setProperty('padding-top',H+'px','important');
+  }catch(_){}
+  /* Re-insert toolbar if missing (handles YouTube-style body replacement). */
+  if(!document.getElementById('_gs_toolbar')){
+    try{document.documentElement.appendChild(bar);}catch(_){return;}
+    _addr.value=_url();
+    if(!_ready){
+      _ready=true;
+      if(_tabTitle)_tabTitle.textContent=document.title||location.hostname||_url();
+      _load(function(){_updateCur();_render();_save();});
+      _watchTitle();
+    }else{
+      /* Re-render existing tab state after re-insertion. */
+      _render();
+    }
+  }
+}
+
+window.addEventListener('load',function(){
+  mount();
+  _addr.value=_url();
+  _load(function(){_updateCur();_render();_save();});
+});
+window.addEventListener('popstate',function(){_addr.value=_url();_updateCur();_save();});
+
 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',mount);}
 else{mount();}
+
+/* Heartbeat: re-inject toolbar if the page removes it (YouTube, SPAs, etc.) */
+setInterval(function(){mount();},500);
 })();`, profileName)
 
 	p.wv.Init(script)
 }
 
+// injectResizeEdges injects a JS listener that detects cursor proximity to
+// viewport edges and calls __ghostStartResize, bypassing the WndProc
+// WM_NCHITTEST path which WebView2's child HWND blocks.
+func (p *WebViewPanel) injectResizeEdges() {
+	p.wv.Init(`(function(){
+'use strict';
+try{if(window!==window.top)return;}catch(e){return;}
+var HT={l:10,r:11,t:12,tl:13,tr:14,b:15,bl:16,br:17};
+var E=8;
+var CS={10:'w-resize',11:'e-resize',12:'n-resize',13:'nw-resize',14:'ne-resize',15:'s-resize',16:'sw-resize',17:'se-resize'};
+function getHT(e){
+  var x=e.clientX,y=e.clientY,w=window.innerWidth,h=window.innerHeight;
+  var L=x<E,R=x>=w-E,T=y<E,B=y>=h-E;
+  if(L&&T)return HT.tl;if(R&&T)return HT.tr;
+  if(L&&B)return HT.bl;if(R&&B)return HT.br;
+  if(T)return HT.t;if(B)return HT.b;
+  if(L)return HT.l;if(R)return HT.r;
+  return 0;
+}
+document.addEventListener('mousemove',function(e){
+  document.documentElement.style.cursor=CS[getHT(e)]||'';
+},true);
+document.addEventListener('mousedown',function(e){
+  if(e.button!==0)return;
+  var h=getHT(e);
+  if(h){e.preventDefault();e.stopPropagation();try{__ghostStartResize(h);}catch(_){}}
+},true);
+})();`)
+}
+
+func (p *WebViewPanel) injectKeyboardShortcuts() {
+	p.wv.Init(`(function(){
+'use strict';
+try{if(window!==window.top)return;}catch(e){return;}
+window.addEventListener('keydown',function(e){
+  if(!e.ctrlKey)return;
+  switch(e.key){
+    case 't':case 'T':
+      e.preventDefault();
+      if(typeof _gsNewTab==='function'){_gsNewTab();}else{location.href='ghost://newtab';}
+      break;
+    case 'w':case 'W':
+      e.preventDefault();
+      if(typeof _gsCloseCurrentTab==='function'){_gsCloseCurrentTab();}else{try{__ghostClose();}catch(_){}}
+      break;
+    case 'l':case 'L':
+      e.preventDefault();
+      var a=document.getElementById('_gs_addr');
+      if(a){a.focus();a.select();}
+      break;
+    case 'r':case 'R':
+      e.preventDefault();location.reload();break;
+  }
+});
+})();`)
+}
+
 // ghostPageHTML returns fully self-contained HTML for ghost:// internal URLs.
-// Uses strings.ReplaceAll to avoid fmt.Sprintf misinterpreting CSS/JS percent signs.
+// The chrome overlay (toolbar, tabs, address bar) is injected separately by
+// injectChromeOverlay, so these pages only contain page content and styling.
 func (p *WebViewPanel) ghostPageHTML(url string) string {
 	page := strings.TrimPrefix(url, "ghost://")
-	profileName := p.br.Profile().Name
 
 	var body string
 	switch page {
@@ -360,78 +566,26 @@ func (p *WebViewPanel) ghostPageHTML(url string) string {
 		body = "<h2>" + page + "</h2><p>Page not found.</p>"
 	}
 
-	// NOTE: % characters in the template are literal CSS/JS — safe because
-	// we use strings.ReplaceAll, not fmt.Sprintf.
+	// __ghostPageURL is read by the chrome overlay to display the ghost://
+	// URL in the address bar instead of the raw data: URL.
 	const tmpl = `<!DOCTYPE html><html><head>
 <meta charset="utf-8"><title>ghost://GSPAGE</title>
+<script>window.__ghostPageURL='ghost://GSPAGE';</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;
   background:linear-gradient(160deg,#1a0a0a 0%,#0d0d30 50%,#050a28 100%);
-  color:#E8E8F4;min-height:100vh}
-#chrome{position:fixed;top:0;left:0;right:0;height:82px;
-  background:linear-gradient(90deg,#3D1A0A 0%,#2A1560 40%,#0A1A6B 70%,#050E40 100%);
-  border-bottom:1px solid rgba(255,255,255,.1);z-index:9999;
-  display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5)}
-#tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:2px;
-  -webkit-app-region:drag}
-.tab,.ntbtn,#wm{-webkit-app-region:no-drag}
-.tab{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.2);
-  border-bottom:none;border-radius:8px 8px 0 0;padding:0 12px;height:30px;
-  display:flex;align-items:center;font-size:12px;color:white;
-  max-width:220px;white-space:nowrap;overflow:hidden}
-.ntbtn{background:transparent;border:none;color:rgba(255,255,255,.6);
-  font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%;
-  align-self:center;line-height:1}
-.ntbtn:hover{background:rgba(255,255,255,.15);color:white}
-#wm{display:flex;align-items:stretch;margin-left:auto;height:38px}
-.wbtn{width:46px;height:100%;border:none;background:transparent;
-  color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;
-  display:flex;align-items:center;justify-content:center}
-.wbtn:hover{background:rgba(255,255,255,.2)}
-#wcls:hover{background:#E81123!important;color:#fff}
-#nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}
-.btn{width:28px;height:28px;border:none;background:transparent;border-radius:50%;
-  cursor:pointer;font-size:16px;color:rgba(255,255,255,.8);
-  display:flex;align-items:center;justify-content:center}
-.btn:hover{background:rgba(255,255,255,.15);color:white}
-#addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);border-radius:15px;
-  padding:0 14px;font-size:13px;background:rgba(255,255,255,.12);color:white;outline:none}
-#addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18)}
-#badge{width:10px;height:10px;border-radius:50%;background:#F4A460;flex-shrink:0;
-  box-shadow:0 0 4px rgba(244,164,96,.6)}
-#content{padding-top:82px;min-height:100vh;display:flex;align-items:center;
-  justify-content:center;text-align:center;padding:82px 20px 20px}
+  color:#E8E8F4;height:100vh;overflow:hidden}
+#content{min-height:100vh;display:flex;align-items:center;
+  justify-content:center;text-align:center;padding:20px}
 #content h2{font-size:2rem;font-weight:700;
   background:linear-gradient(90deg,#F4A460,#A080FF);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 </style></head><body>
-<div id="chrome">
-  <div id="tabs" onmousedown="if(event.button===0&&!event.target.closest('button,input,a')){try{__ghostStartDrag();}catch(_){}}">
-    <div class="tab"><span>ghost://GSPAGE</span></div>
-    <button class="ntbtn" title="New Tab" onclick="location.href='ghost://newtab'">+</button>
-    <div id="wm">
-      <button class="wbtn" title="Minimise" onclick="try{__ghostMinimize();}catch(e){}">&#8212;</button>
-      <button class="wbtn" title="Maximise" onclick="try{__ghostMaximize();}catch(e){}">&#9633;</button>
-      <button class="wbtn" id="wcls" title="Close" onclick="try{__ghostClose();}catch(e){}">&#10005;</button>
-    </div>
-  </div>
-  <div id="nav">
-    <button class="btn" onclick="history.back()" title="Back">&#8592;</button>
-    <button class="btn" onclick="history.forward()" title="Forward">&#8594;</button>
-    <button class="btn" onclick="location.reload()" title="Reload">&#8635;</button>
-    <input id="addr" type="text" spellcheck="false"
-      placeholder="Search or enter address" value="ghost://GSPAGE"
-      onkeydown="if(event.key==='Enter'){var u=this.value.trim();if(!u)return;if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}else{u='https://search.brave.com/search?q='+encodeURIComponent(u);}}location.href=u;}"
-    />
-    <div id="badge" title="Profile: GSPROFILE"></div>
-  </div>
-</div>
 <div id="content">GSBODY</div>
 </body></html>`
 
 	html := strings.ReplaceAll(tmpl, "GSPAGE", page)
-	html = strings.ReplaceAll(html, "GSPROFILE", profileName)
 	html = strings.ReplaceAll(html, "GSBODY", body)
 	return html
 }
@@ -630,7 +784,9 @@ func min(a, b int) int {
 // subclassFrameless installs a WndProc on the go-webview2 host window that
 // eliminates the non-client border strip and provides correct resize hit
 // targets, while leaving HTCLIENT for the interior so WebView2 receives all
-// mouse events and can handle -webkit-app-region:drag internally.
+// mouse events.  Actual border resizing is handled by injectResizeEdges via
+// JS, since WebView2's child HWND intercepts the border mouse events before
+// the host WndProc sees them.
 func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	const (
 		gwlpWndProc   = ^uintptr(3) // -4: index for the window procedure
@@ -659,15 +815,11 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 		switch msg {
 		case wmNcCalcSize:
 			if wp != 0 {
-				// Claim the entire window rect as client area — this removes
-				// the leftover non-client strip that WS_THICKFRAME adds after
-				// WS_CAPTION is stripped.
 				return 0
 			}
 		case wmNcHitTest:
 			var wr win.RECT
 			win.GetWindowRect(win.HWND(h), &wr)
-			// lp = MAKELONG(xScreen, yScreen)
 			x := int32(int16(lp & 0xFFFF))
 			y := int32(int16((lp >> 16) & 0xFFFF))
 			cx := x - wr.Left
@@ -704,7 +856,7 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	setWndLongPtr.Call(uintptr(hwnd), gwlpWndProc, cb)
 }
 
-// ── resize ────────────────────────────────────────────────────────────────────
+// ── resize (legacy — now superseded by injectResizeEdges) ────────────────────
 
 func (p *WebViewPanel) onResize() {
 	if p.wv == nil || p.mainWindow == nil {
@@ -722,7 +874,6 @@ func (p *WebViewPanel) ForceResize() { p.onResize() }
 
 // ── ghost:// scheme ───────────────────────────────────────────────────────────
 
-// handleGhostScheme is bound to JavaScript as __ghostNavigate.
 func (p *WebViewPanel) handleGhostScheme(url string) string {
 	return fmt.Sprintf(`<p>ghost: %s</p>`, url)
 }

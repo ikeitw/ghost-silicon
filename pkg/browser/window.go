@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -166,13 +165,6 @@ func (w *Window) Open() error {
 	w.wireActions()
 	w.wireWebViewCallbacks()
 
-	// ── Closing hook ──────────────────────────────────────────────────────
-	mw.Closing().Attach(func(cancelled *bool, reason walk.CloseReason) {
-		w.log.Info("browser window closing")
-		cancel()
-		DisposeThemeFonts()
-	})
-
 	// ── Initial navigation ────────────────────────────────────────────────
 	w.log.Info("browser window open",
 		"profile", w.opts.Bridge.Profile().Name,
@@ -181,22 +173,11 @@ func (w *Window) Open() error {
 	)
 	w.webview.Navigate(defaultHomeURL)
 
-	// ── Post-layout resize ────────────────────────────────────────────────
-	// Walk's SizeChanged fires during the first layout pass, but ClientBounds()
-	// returns zero at that point because mw.Run() hasn't processed its first
-	// WM_PAINT yet.  We schedule a ForceResize 300 ms after startup so that
-	// WebView2 is sized and the initial page is visible immediately on open.
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		w.mw.Synchronize(func() {
-			w.webview.ForceResize()
-			w.webview.Navigate(defaultHomeURL)
-		})
-	}()
-
 	// ── Message loop ──────────────────────────────────────────────────────
 	_ = ctx // reserved for future goroutines owned by Window
 	mw.Run()
+	w.log.Info("browser window closing")
+	DisposeThemeFonts()
 	return nil
 }
 

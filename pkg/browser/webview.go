@@ -26,6 +26,7 @@ import (
 
 	webview2 "github.com/jchv/go-webview2"
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
@@ -81,6 +82,31 @@ func NewWebViewPanel(
 	}
 	p.wv = wv
 	p.log.Info("webview2 initialised")
+
+	// ── Window management bindings ────────────────────────────────────────
+	// go-webview2 always creates its own top-level window regardless of the
+	// Window option passed to NewWithOptions.  wv.Window() is that window's
+	// HWND — the one the user actually sees and interacts with.  All min/max/
+	// close operations must target it, not Walk's MainWindow HWND.
+	const swMaximize = 3 // SW_SHOWMAXIMIZED — used to detect current state
+	wvHWND := win.HWND(uintptr(p.wv.Window()))
+
+	p.wv.Bind("__ghostMinimize", func() {
+		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
+	})
+	p.wv.Bind("__ghostMaximize", func() {
+		var wp win.WINDOWPLACEMENT
+		wp.Length = uint32(unsafe.Sizeof(wp))
+		win.GetWindowPlacement(wvHWND, &wp)
+		if wp.ShowCmd == swMaximize {
+			win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_RESTORE, 0)
+		} else {
+			win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MAXIMIZE, 0)
+		}
+	})
+	p.wv.Bind("__ghostClose", func() {
+		win.PostMessage(wvHWND, win.WM_CLOSE, 0, 0)
+	})
 
 	if err := p.injectPolyfill(); err != nil {
 		p.log.Warn("polyfill injection failed", "error", err.Error())
@@ -167,169 +193,117 @@ func (p *WebViewPanel) UpdateProfile() {
 func (p *WebViewPanel) injectChromeOverlay() {
 	profileName := p.br.Profile().Name
 
+	// %q embeds the profile name safely; %% produces a literal % in CSS.
 	script := fmt.Sprintf(`(function(){
 'use strict';
-
-// Skip injection on our own internal pages.
 if(window.location.href.startsWith('data:')||window.location.href==='about:blank')return;
-
-// Avoid double-injection on SPA navigations.
 if(document.getElementById('_gs_toolbar'))return;
-
-var CHROME_H = 82;
-var profile  = %q;
-
-// ── Styles ─────────────────────────────────────────────────────────────────
-var css = [
+var CHROME_H=82;
+var profile=%q;
+var styleEl=document.createElement('style');
+styleEl.textContent=[
   '#_gs_toolbar{position:fixed;top:0;left:0;right:0;height:'+CHROME_H+'px;',
-  'background:#EDEEF2;border-bottom:1px solid #C8C8D2;z-index:2147483647;',
-  'display:flex;flex-direction:column;font-family:"Segoe UI",system-ui,sans-serif;',
-  'box-shadow:0 1px 3px rgba(0,0,0,.12);}',
-
-  '#_gs_tabs{height:38px;display:flex;align-items:flex-end;padding:0 8px 0 8px;gap:2px;}',
-
-  '#_gs_tab{background:#fff;border:1px solid #C8C8D2;border-bottom:none;',
-  'border-radius:8px 8px 0 0;padding:0 12px;height:30px;display:flex;',
-  'align-items:center;font-size:12px;max-width:200px;gap:6px;',
-  'white-space:nowrap;overflow:hidden;}',
-
+  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);',
+  'border-bottom:1px solid rgba(255,255,255,.1);z-index:2147483647;',
+  'display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5);}',
+  '#_gs_tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:2px;',
+  '-webkit-app-region:drag;}',  /* drag the window by the tab bar background */
+  /* interactive children must opt out of dragging */
+  '#_gs_tab,#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag;}',
+  '#_gs_tab{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.2);',
+  'border-bottom:none;border-radius:8px 8px 0 0;padding:0 12px;height:30px;',
+  'display:flex;align-items:center;font-size:12px;color:white;',
+  'max-width:220px;white-space:nowrap;overflow:hidden;}',
   '#_gs_tab_title{overflow:hidden;text-overflow:ellipsis;flex:1;}',
-
-  '#_gs_new_tab{width:24px;height:24px;border:none;background:transparent;',
-  'border-radius:50%;cursor:pointer;font-size:18px;line-height:24px;',
-  'text-align:center;color:#666;margin-left:4px;align-self:center;}',
-  '#_gs_new_tab:hover{background:#D8D8E0;}',
-
+  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.6);',
+  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%;align-self:center;line-height:1;}',
+  '#_gs_new_tab:hover{background:rgba(255,255,255,.15);color:white;}',
   '#_gs_nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px;}',
-
   '._gs_btn{width:28px;height:28px;border:none;background:transparent;',
-  'border-radius:50%;cursor:pointer;font-size:15px;display:flex;',
-  'align-items:center;justify-content:center;color:#333;}',
-  '._gs_btn:hover{background:#D0D0DA;}',
-  '._gs_btn:disabled{opacity:.35;cursor:default;}',
-
-  '#_gs_addr{flex:1;height:30px;border:1px solid #C0C0CA;border-radius:15px;',
-  'padding:0 14px;font-size:13px;background:#fff;outline:none;}',
-  '#_gs_addr:focus{border-color:#4285F4;box-shadow:0 0 0 2px rgba(66,133,244,.2);}',
-
-  '#_gs_badge{width:10px;height:10px;border-radius:50%;background:#32B264;',
-  'flex-shrink:0;cursor:default;margin-left:2px;}',
-
+  'border-radius:50%%;cursor:pointer;font-size:16px;color:rgba(255,255,255,.8);',
+  'display:flex;align-items:center;justify-content:center;}',
+  '._gs_btn:hover{background:rgba(255,255,255,.15);color:white;}',
+  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);',
+  'border-radius:15px;padding:0 14px;font-size:13px;',
+  'background:rgba(255,255,255,.12);color:white;outline:none;}',
+  '#_gs_addr::placeholder{color:rgba(255,255,255,.4);}',
+  '#_gs_addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18);}',
+  '#_gs_badge{width:10px;height:10px;border-radius:50%%;background:#F4A460;',
+  'flex-shrink:0;box-shadow:0 0 4px rgba(244,164,96,.6);}',
+  /* Window control buttons (close / maximise / minimise) */
+  '#_gs_wm_btns{display:flex;align-items:stretch;margin-left:auto;height:38px;-webkit-app-region:no-drag;}',
+  '._gs_wm_btn{width:46px;height:100%%;border:none;background:transparent;',
+  'color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;',
+  'display:flex;align-items:center;justify-content:center;}',
+  '._gs_wm_btn:hover{background:rgba(255,255,255,.2);}',
+  '#_gs_cls:hover{background:#E81123!important;color:#fff;}',
   'body{padding-top:'+CHROME_H+'px!important;}'
 ].join('');
-
-var styleEl = document.createElement('style');
-styleEl.textContent = css;
-
-// ── HTML ────────────────────────────────────────────────────────────────────
-var bar = document.createElement('div');
-bar.id  = '_gs_toolbar';
-bar.innerHTML =
-  '<div id="_gs_tabs">' +
-    '<div id="_gs_tab">' +
-      '<span id="_gs_tab_title">Loading…</span>' +
-    '</div>' +
-    '<button id="_gs_new_tab" title="New Tab">+</button>' +
-  '</div>' +
-  '<div id="_gs_nav">' +
-    '<button class="_gs_btn" id="_gs_back"    title="Back">&#8592;</button>' +
-    '<button class="_gs_btn" id="_gs_fwd"     title="Forward">&#8594;</button>' +
-    '<button class="_gs_btn" id="_gs_reload"  title="Reload">&#8635;</button>' +
-    '<input  id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>' +
-    '<div id="_gs_badge" title="Profile: '+profile+'"></div>' +
+var bar=document.createElement('div');
+bar.id='_gs_toolbar';
+bar.innerHTML=
+  '<div id="_gs_tabs">'+
+    '<div id="_gs_tab"><span id="_gs_tab_title">Loading\u2026</span></div>'+
+    '<button id="_gs_new_tab" title="New Tab">+</button>'+
+    '<div id="_gs_wm_btns">'+
+      '<button class="_gs_wm_btn" id="_gs_min" title="Minimise">&#8212;</button>'+
+      '<button class="_gs_wm_btn" id="_gs_max" title="Maximise">&#9633;</button>'+
+      '<button class="_gs_wm_btn" id="_gs_cls" title="Close">&#10005;</button>'+
+    '</div>'+
+  '</div>'+
+  '<div id="_gs_nav">'+
+    '<button class="_gs_btn" id="_gs_back" title="Back">&#8592;</button>'+
+    '<button class="_gs_btn" id="_gs_fwd" title="Forward">&#8594;</button>'+
+    '<button class="_gs_btn" id="_gs_reload" title="Reload">&#8635;</button>'+
+    '<input id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>'+
+    '<div id="_gs_badge" title="Profile: '+profile+'"></div>'+
   '</div>';
-
-// ── Mount ───────────────────────────────────────────────────────────────────
 function mount(){
   if(document.getElementById('_gs_toolbar'))return;
   document.head.appendChild(styleEl);
-  document.body.insertAdjacentElement('afterbegin', bar);
-
-  // Populate address bar.
-  var addr = document.getElementById('_gs_addr');
-  addr.value = location.href;
-
-  // Tab title.
+  document.body.insertAdjacentElement('afterbegin',bar);
+  var addr=document.getElementById('_gs_addr');
+  addr.value=location.href;
   function updateTitle(){
-    var t = document.getElementById('_gs_tab_title');
-    if(t) t.textContent = document.title || location.hostname || 'New Tab';
+    var t=document.getElementById('_gs_tab_title');
+    if(t)t.textContent=document.title||location.hostname||'New Tab';
   }
   updateTitle();
-  new MutationObserver(updateTitle).observe(document.querySelector('title')||document.head,
-    {childList:true,characterData:true,subtree:true});
-
-  // ── Navigation buttons ─────────────────────────────────────────────────
+  new MutationObserver(updateTitle).observe(document.querySelector('title')||document.head,{childList:true,characterData:true,subtree:true});
   document.getElementById('_gs_back').addEventListener('click',function(){history.back();});
-  document.getElementById('_gs_fwd' ).addEventListener('click',function(){history.forward();});
+  document.getElementById('_gs_fwd').addEventListener('click',function(){history.forward();});
   document.getElementById('_gs_reload').addEventListener('click',function(){location.reload();});
-
-  // ── Address bar ────────────────────────────────────────────────────────
+  document.getElementById('_gs_min').addEventListener('click',function(){try{__ghostMinimize();}catch(e){}});
+  document.getElementById('_gs_max').addEventListener('click',function(){try{__ghostMaximize();}catch(e){}});
+  document.getElementById('_gs_cls').addEventListener('click',function(){try{__ghostClose();}catch(e){}});
   addr.addEventListener('keydown',function(e){
     if(e.key!=='Enter')return;
     e.preventDefault();
-    var raw = addr.value.trim();
-    if(!raw)return;
-    var url = raw;
-    if(url.startsWith('ghost://')){
-      // let the Go side handle it
-    } else if(!url.match(/^https?:\/\//i)){
-      if(url.indexOf('.')!==-1 && url.indexOf(' ')===-1){
-        url = 'https://'+url;
-      } else {
-        url = 'https://search.brave.com/search?q='+encodeURIComponent(url);
-      }
+    var raw=addr.value.trim();if(!raw)return;
+    var url=raw;
+    if(!url.match(/^https?:\/\//i)&&!url.startsWith('ghost://')){
+      if(url.indexOf('.')>=0&&url.indexOf(' ')<0){url='https://'+url;}
+      else{url='https://search.brave.com/search?q='+encodeURIComponent(url);}
     }
-    location.href = url;
+    location.href=url;
   });
   addr.addEventListener('focus',function(){addr.select();});
-
-  // ── Update address on navigation ───────────────────────────────────────
-  window.addEventListener('load',function(){
-    addr.value = location.href;
-    updateTitle();
-  });
+  window.addEventListener('load',function(){addr.value=location.href;updateTitle();});
   window.addEventListener('popstate',function(){addr.value=location.href;});
-
-  // ── New tab button ─────────────────────────────────────────────────────
+  // New tab navigates the current page (single WebView2 instance)
   document.getElementById('_gs_new_tab').addEventListener('click',function(){
-    try{ window.open('ghost://newtab','_blank'); }catch(e){}
+    location.href='ghost://newtab';
   });
 }
-
-if(document.readyState==='loading'){
-  document.addEventListener('DOMContentLoaded',mount);
-}else{
-  mount();
-}
-
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',mount);}
+else{mount();}
 })();`, profileName)
 
 	p.wv.Init(script)
 }
 
-// ── resize ────────────────────────────────────────────────────────────────────
-
-func (p *WebViewPanel) onResize() {
-	if p.wv == nil || p.mainWindow == nil {
-		return
-	}
-	b := p.mainWindow.ClientBounds()
-	if b.Width > 0 && b.Height > 0 {
-		p.log.Info("webview2 resize", "w", b.Width, "h", b.Height)
-		p.wv.SetSize(b.Width, b.Height, webview2.HintNone)
-	}
-}
-
-func (p *WebViewPanel) ForceResize() { p.onResize() }
-
-// ── ghost:// scheme ───────────────────────────────────────────────────────────
-
-func (p *WebViewPanel) handleGhostScheme(url string) string {
-	return fmt.Sprintf(`<h2>ghost://</h2><p>%s</p>`, url)
-}
-
 // ghostPageHTML returns fully self-contained HTML for ghost:// internal URLs.
-// These pages include the browser chrome inline (no overlay injection needed).
+// Uses strings.ReplaceAll to avoid fmt.Sprintf misinterpreting CSS/JS percent signs.
 func (p *WebViewPanel) ghostPageHTML(url string) string {
 	page := strings.TrimPrefix(url, "ghost://")
 	profileName := p.br.Profile().Name
@@ -337,62 +311,91 @@ func (p *WebViewPanel) ghostPageHTML(url string) string {
 	var body string
 	switch page {
 	case "settings":
-		body = `<h2>⚙ Settings</h2><p>Settings UI coming in Phase 2.</p>`
-	case "newtab":
-		body = `<h2>👻 Ghost-Silicon</h2><p style="color:#666;margin-top:8px;">Type an address in the bar above and press Enter.</p>`
+		body = "<h2>Settings</h2><p>Settings UI - Phase 2.</p>"
+	case "newtab", "":
+		body = "<h2>Ghost-Silicon</h2><p style=\"margin-top:10px;opacity:.7\">Type an address above and press Enter.</p>"
 	case "network":
-		body = `<h2>🌐 Network Monitor</h2><p>Coming in Phase 2.</p>`
+		body = "<h2>Network Monitor</h2><p>Coming in Phase 2.</p>"
 	case "audit":
-		body = `<h2>📋 Audit Log</h2><p>Coming in Phase 2.</p>`
+		body = "<h2>Audit Log</h2><p>Coming in Phase 2.</p>"
 	default:
-		body = fmt.Sprintf(`<h2>%s</h2><p>Page not found.</p>`, page)
+		body = "<h2>" + page + "</h2><p>Page not found.</p>"
 	}
 
-	return fmt.Sprintf(`<!DOCTYPE html><html><head>
-<meta charset="utf-8"><title>ghost://%s</title>
+	// NOTE: % characters in the template are literal CSS/JS — safe because
+	// we use strings.ReplaceAll, not fmt.Sprintf.
+	const tmpl = `<!DOCTYPE html><html><head>
+<meta charset="utf-8"><title>ghost://GSPAGE</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#F8F8FA;color:#191923}
-#chrome{position:fixed;top:0;left:0;right:0;height:82px;background:#EDEEF2;
-  border-bottom:1px solid #C8C8D2;z-index:9999;display:flex;flex-direction:column;
-  box-shadow:0 1px 3px rgba(0,0,0,.1)}
-#tabs{height:38px;display:flex;align-items:flex-end;padding:0 8px;gap:2px}
-.tab{background:#fff;border:1px solid #C8C8D2;border-bottom:none;
-  border-radius:8px 8px 0 0;padding:0 14px;height:30px;display:flex;
-  align-items:center;font-size:12px;gap:8px}
+body{font-family:'Segoe UI',system-ui,sans-serif;
+  background:linear-gradient(160deg,#1a0a0a 0%,#0d0d30 50%,#050a28 100%);
+  color:#E8E8F4;min-height:100vh}
+#chrome{position:fixed;top:0;left:0;right:0;height:82px;
+  background:linear-gradient(90deg,#3D1A0A 0%,#2A1560 40%,#0A1A6B 70%,#050E40 100%);
+  border-bottom:1px solid rgba(255,255,255,.1);z-index:9999;
+  display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5)}
+#tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:2px;
+  -webkit-app-region:drag}
+.tab,.ntbtn,#wm{-webkit-app-region:no-drag}
+.tab{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.2);
+  border-bottom:none;border-radius:8px 8px 0 0;padding:0 12px;height:30px;
+  display:flex;align-items:center;font-size:12px;color:white;
+  max-width:220px;white-space:nowrap;overflow:hidden}
+.ntbtn{background:transparent;border:none;color:rgba(255,255,255,.6);
+  font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%;
+  align-self:center;line-height:1}
+.ntbtn:hover{background:rgba(255,255,255,.15);color:white}
+#wm{display:flex;align-items:stretch;margin-left:auto;height:38px}
+.wbtn{width:46px;height:100%;border:none;background:transparent;
+  color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center}
+.wbtn:hover{background:rgba(255,255,255,.2)}
+#wcls:hover{background:#E81123!important;color:#fff}
 #nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}
 .btn{width:28px;height:28px;border:none;background:transparent;border-radius:50%;
-  cursor:pointer;font-size:15px;color:#333}
-.btn:hover{background:#D0D0DA}
-#addr{flex:1;height:30px;border:1px solid #C0C0CA;border-radius:15px;
-  padding:0 14px;font-size:13px;background:#fff;outline:none}
-#addr:focus{border-color:#4285F4;box-shadow:0 0 0 2px rgba(66,133,244,.2)}
-#badge{width:10px;height:10px;border-radius:50%;background:#32B264;flex-shrink:0}
+  cursor:pointer;font-size:16px;color:rgba(255,255,255,.8);
+  display:flex;align-items:center;justify-content:center}
+.btn:hover{background:rgba(255,255,255,.15);color:white}
+#addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);border-radius:15px;
+  padding:0 14px;font-size:13px;background:rgba(255,255,255,.12);color:white;outline:none}
+#addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18)}
+#badge{width:10px;height:10px;border-radius:50%;background:#F4A460;flex-shrink:0;
+  box-shadow:0 0 4px rgba(244,164,96,.6)}
 #content{padding-top:82px;min-height:100vh;display:flex;align-items:center;
-  justify-content:center;text-align:center}
-#content h2{font-size:1.8rem;font-weight:700;margin-bottom:.6rem}
-</style>
-</head><body>
+  justify-content:center;text-align:center;padding:82px 20px 20px}
+#content h2{font-size:2rem;font-weight:700;
+  background:linear-gradient(90deg,#F4A460,#A080FF);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+</style></head><body>
 <div id="chrome">
   <div id="tabs">
-    <div class="tab"><span>ghost://%s</span></div>
-    <button class="btn" style="margin-left:4px;font-size:18px;align-self:center" title="New Tab">+</button>
+    <div class="tab"><span>ghost://GSPAGE</span></div>
+    <button class="ntbtn" title="New Tab" onclick="location.href='ghost://newtab'">+</button>
+    <div id="wm">
+      <button class="wbtn" title="Minimise" onclick="try{__ghostMinimize();}catch(e){}">&#8212;</button>
+      <button class="wbtn" title="Maximise" onclick="try{__ghostMaximize();}catch(e){}">&#9633;</button>
+      <button class="wbtn" id="wcls" title="Close" onclick="try{__ghostClose();}catch(e){}">&#10005;</button>
+    </div>
   </div>
   <div id="nav">
     <button class="btn" onclick="history.back()" title="Back">&#8592;</button>
     <button class="btn" onclick="history.forward()" title="Forward">&#8594;</button>
     <button class="btn" onclick="location.reload()" title="Reload">&#8635;</button>
     <input id="addr" type="text" spellcheck="false"
-      placeholder="Search or enter address"
-      value="ghost://%s"
-      onkeydown="if(event.key==='Enter'){var u=this.value.trim();if(u)location.href=(u.match(/^https?:\/\//i)||u.startsWith('ghost://'))?u:(u.includes('.')&&!u.includes(' '))?'https://'+u:'https://search.brave.com/search?q='+encodeURIComponent(u)}"
+      placeholder="Search or enter address" value="ghost://GSPAGE"
+      onkeydown="if(event.key==='Enter'){var u=this.value.trim();if(!u)return;if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}else{u='https://search.brave.com/search?q='+encodeURIComponent(u);}}location.href=u;}"
     />
-    <div id="badge" title="Profile: %s"></div>
+    <div id="badge" title="Profile: GSPROFILE"></div>
   </div>
 </div>
-<div id="content">%s</div>
-</body></html>`,
-		page, page, page, page, profileName, body)
+<div id="content">GSBODY</div>
+</body></html>`
+
+	html := strings.ReplaceAll(tmpl, "GSPAGE", page)
+	html = strings.ReplaceAll(html, "GSPROFILE", profileName)
+	html = strings.ReplaceAll(html, "GSBODY", body)
+	return html
 }
 
 // ── event bridge ─────────────────────────────────────────────────────────────
@@ -582,4 +585,27 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ── resize ────────────────────────────────────────────────────────────────────
+
+func (p *WebViewPanel) onResize() {
+	if p.wv == nil || p.mainWindow == nil {
+		return
+	}
+	b := p.mainWindow.ClientBounds()
+	if b.Width > 0 && b.Height > 0 {
+		p.log.Info("webview2 resize", "w", b.Width, "h", b.Height)
+		p.wv.SetSize(b.Width, b.Height, webview2.HintNone)
+	}
+}
+
+// ForceResize explicitly sizes WebView2 after Walk's first layout pass.
+func (p *WebViewPanel) ForceResize() { p.onResize() }
+
+// ── ghost:// scheme ───────────────────────────────────────────────────────────
+
+// handleGhostScheme is bound to JavaScript as __ghostNavigate.
+func (p *WebViewPanel) handleGhostScheme(url string) string {
+	return fmt.Sprintf(`<p>ghost: %s</p>`, url)
 }

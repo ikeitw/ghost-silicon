@@ -11,9 +11,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
@@ -85,7 +88,46 @@ func (w *Window) Open() error {
 	}
 	w.mw = mw
 	mw.SetTitle(w.windowTitle(""))
+
+	// ── Frameless chrome ──────────────────────────────────────────────────
+	// Remove the OS title bar so the HTML overlay tab strip acts as the
+	// window frame (Chrome-style). We keep WS_THICKFRAME so the window
+	// remains resizable from all edges, and call DwmExtendFrameIntoClientArea
+	// with a 1-pixel top margin to restore the DWM drop-shadow and Windows 11
+	// rounded corners that are otherwise lost when WS_CAPTION is removed.
+	mwHWND := win.HWND(uintptr(mw.Handle()))
+	curStyle := win.GetWindowLong(mwHWND, win.GWL_STYLE)
+	win.SetWindowLong(mwHWND, win.GWL_STYLE, curStyle&^win.WS_CAPTION)
+	win.SetWindowPos(mwHWND, 0, 0, 0, 0, 0,
+		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+
+	// Restore shadow + rounded corners via DWM.
+	type dwmMargins struct{ L, R, T, B int32 }
+	m := dwmMargins{0, 0, 1, 0}
+	syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmExtendFrameIntoClientArea").Call(
+		uintptr(mwHWND), uintptr(unsafe.Pointer(&m)))
+
 	mw.SetSize(walk.Size{Width: defaultWindowW, Height: defaultWindowH})
+
+	// Dark background — prevents a white flash when the window resizes before
+	// WebView2 catches up. Colour matches the ghost:// page background.
+	if bgBrush, err := walk.NewSolidColorBrush(walk.RGB(10, 10, 30)); err == nil {
+		mw.SetBackground(bgBrush)
+	}
+
+	// WS_CLIPCHILDREN: prevent Walk's background fill from painting over the
+	// WebView2 area during resize/maximize transitions.
+	curStyle2 := win.GetWindowLong(mwHWND, win.GWL_STYLE)
+	win.SetWindowLong(mwHWND, win.GWL_STYLE, curStyle2|win.WS_CLIPCHILDREN)
+
+	// Walk requires a non-nil layout on the main window so its internal
+	// startLayout call (triggered on every WM_SIZE) does not panic.
+	// The VBoxLayout has no Walk-managed children — WebView2 is a raw HWND
+	// invisible to Walk's widget tree — so it is a safe no-op.
+	emptyLayout := walk.NewVBoxLayout()
+	emptyLayout.SetMargins(walk.Margins{})
+	emptyLayout.SetSpacing(0)
+	mw.SetLayout(emptyLayout)
 
 	// ── Menu bar + Actions ────────────────────────────────────────────────
 	w.actions, err = BuildMenu(mw)
@@ -101,6 +143,11 @@ func (w *Window) Open() error {
 	if err != nil {
 		return fmt.Errorf("webview panel: %w", err)
 	}
+
+	// go-webview2 creates its own top-level window; Walk's MainWindow is an
+	// unused background window.  Hide it so only the WebView2 window is
+	// visible to the user.
+	win.ShowWindow(mwHWND, win.SW_HIDE)
 
 	// ── Download manager + bookmarks ──────────────────────────────────────
 	w.dlMgr = NewDownloadManager()
@@ -118,11 +165,6 @@ func (w *Window) Open() error {
 	// ── Wire callbacks ────────────────────────────────────────────────────
 	w.wireActions()
 	w.wireWebViewCallbacks()
-
-	// ── Status bar ────────────────────────────────────────────────────────
-	if err := w.buildStatusBar(); err != nil {
-		w.log.Warn("status bar unavailable", "error", err.Error())
-	}
 
 	// ── Closing hook ──────────────────────────────────────────────────────
 	mw.Closing().Attach(func(cancelled *bool, reason walk.CloseReason) {

@@ -1,5 +1,6 @@
 # Claude Code local memory and settings
 .claude/
+.claude/settings.local.json
 
 # Build output
 bin/

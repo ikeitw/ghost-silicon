@@ -47,6 +47,8 @@ type WebViewPanel struct {
 	log         *logging.Logger
 	userDataDir string
 
+	wndProcCb uintptr // keeps subclassed WndProc callback alive (GC guard)
+
 	// Callbacks set by Window after construction.
 	OnTitleChange  func(title string)
 	OnURLChange    func(url string)
@@ -85,21 +87,30 @@ func NewWebViewPanel(
 	p.log.Info("webview2 initialised")
 
 	// ── Frameless chrome ──────────────────────────────────────────────────
-	// go-webview2 creates its window with WS_OVERLAPPEDWINDOW which includes
-	// a native title bar.  Strip WS_CAPTION (keeping WS_THICKFRAME so all
-	// four edges remain resizable) and add WS_CLIPCHILDREN to prevent the
-	// window background from flashing over the WebView2 rendering surface.
-	// DwmExtendFrameIntoClientArea with a 1-px top margin restores the DWM
-	// drop-shadow and Windows 11 rounded corners.
+	// go-webview2 creates its window as WS_OVERLAPPEDWINDOW (native title bar
+	// + border). We strip WS_CAPTION and subclass the WndProc to:
+	//   • WM_NCCALCSIZE: return 0 so the entire window rect is client area,
+	//     eliminating the non-client border strip completely.
+	//   • WM_NCHITTEST: return resize hit-values for the 8-px edge zone;
+	//     return HTCLIENT for everything else so mouse events reach WebView2,
+	//     which handles tab-bar dragging internally via -webkit-app-region:drag.
+	// DwmSetWindowAttribute restores the DWM shadow and Windows 11 rounded
+	// corners that WS_CAPTION removal would otherwise kill.
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
 	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
 	win.SetWindowLong(wvHWND, win.GWL_STYLE, wvStyle&^win.WS_CAPTION|win.WS_CLIPCHILDREN)
 	win.SetWindowPos(wvHWND, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
-	type dwmMargins struct{ L, R, T, B int32 }
-	dwmM := dwmMargins{0, 0, 1, 0}
-	syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmExtendFrameIntoClientArea").Call(
-		uintptr(wvHWND), uintptr(unsafe.Pointer(&dwmM)))
+	p.subclassFrameless(wvHWND)
+	dwmapi := syscall.NewLazyDLL("dwmapi.dll")
+	// Restore DWM shadow (disabled when WS_CAPTION is removed).
+	ncPolicy := uint32(2) // DWMNCRP_ENABLED
+	dwmapi.NewProc("DwmSetWindowAttribute").Call(
+		uintptr(wvHWND), 2, uintptr(unsafe.Pointer(&ncPolicy)), 4)
+	// Windows 11: keep rounded corners.
+	cornerPref := uint32(2) // DWMWCP_ROUND
+	dwmapi.NewProc("DwmSetWindowAttribute").Call(
+		uintptr(wvHWND), 33, uintptr(unsafe.Pointer(&cornerPref)), 4)
 
 	// ── Window management bindings ────────────────────────────────────────
 	// go-webview2 always creates its own top-level window regardless of the
@@ -123,6 +134,13 @@ func NewWebViewPanel(
 	})
 	p.wv.Bind("__ghostClose", func() {
 		win.PostMessage(wvHWND, win.WM_CLOSE, 0, 0)
+	})
+	p.wv.Bind("__ghostStartDrag", func() {
+		var pt win.POINT
+		win.GetCursorPos(&pt)
+		lp := uintptr(pt.Y)<<16 | uintptr(uint16(pt.X))
+		win.ReleaseCapture()
+		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, win.HTCAPTION, lp)
 	})
 
 	if err := p.injectPolyfill(); err != nil {
@@ -287,6 +305,9 @@ function mount(){
   }
   updateTitle();
   new MutationObserver(updateTitle).observe(document.querySelector('title')||document.head,{childList:true,characterData:true,subtree:true});
+  document.getElementById('_gs_tabs').addEventListener('mousedown',function(e){
+    if(e.button===0&&!e.target.closest('button,input,a')){try{__ghostStartDrag();}catch(_){}}
+  });
   document.getElementById('_gs_back').addEventListener('click',function(){history.back();});
   document.getElementById('_gs_fwd').addEventListener('click',function(){history.forward();});
   document.getElementById('_gs_reload').addEventListener('click',function(){location.reload();});
@@ -386,7 +407,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 </style></head><body>
 <div id="chrome">
-  <div id="tabs">
+  <div id="tabs" onmousedown="if(event.button===0&&!event.target.closest('button,input,a')){try{__ghostStartDrag();}catch(_){}}">
     <div class="tab"><span>ghost://GSPAGE</span></div>
     <button class="ntbtn" title="New Tab" onclick="location.href='ghost://newtab'">+</button>
     <div id="wm">
@@ -602,6 +623,85 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ── frameless WndProc subclass ────────────────────────────────────────────────
+
+// subclassFrameless installs a WndProc on the go-webview2 host window that
+// eliminates the non-client border strip and provides correct resize hit
+// targets, while leaving HTCLIENT for the interior so WebView2 receives all
+// mouse events and can handle -webkit-app-region:drag internally.
+func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
+	const (
+		gwlpWndProc   = ^uintptr(3) // -4: index for the window procedure
+		wmNcCalcSize  = uintptr(0x0083)
+		wmNcHitTest   = uintptr(0x0084)
+		htClient      = uintptr(1)
+		htLeft        = uintptr(10)
+		htRight       = uintptr(11)
+		htTop         = uintptr(12)
+		htTopLeft     = uintptr(13)
+		htTopRight    = uintptr(14)
+		htBottom      = uintptr(15)
+		htBottomLeft  = uintptr(16)
+		htBottomRight = uintptr(17)
+		resizeBorder  = int32(8)
+	)
+
+	user32 := syscall.NewLazyDLL("user32.dll")
+	getWndLongPtr := user32.NewProc("GetWindowLongPtrW")
+	setWndLongPtr := user32.NewProc("SetWindowLongPtrW")
+	callWndProc := user32.NewProc("CallWindowProcW")
+
+	origProc, _, _ := getWndLongPtr.Call(uintptr(hwnd), gwlpWndProc)
+
+	cb := syscall.NewCallback(func(h, msg, wp, lp uintptr) uintptr {
+		switch msg {
+		case wmNcCalcSize:
+			if wp != 0 {
+				// Claim the entire window rect as client area — this removes
+				// the leftover non-client strip that WS_THICKFRAME adds after
+				// WS_CAPTION is stripped.
+				return 0
+			}
+		case wmNcHitTest:
+			var wr win.RECT
+			win.GetWindowRect(win.HWND(h), &wr)
+			// lp = MAKELONG(xScreen, yScreen)
+			x := int32(int16(lp & 0xFFFF))
+			y := int32(int16((lp >> 16) & 0xFFFF))
+			cx := x - wr.Left
+			cy := y - wr.Top
+			w := wr.Right - wr.Left
+			ht := wr.Bottom - wr.Top
+			rb := resizeBorder
+			switch {
+			case cx < rb && cy < rb:
+				return htTopLeft
+			case cx >= w-rb && cy < rb:
+				return htTopRight
+			case cx < rb && cy >= ht-rb:
+				return htBottomLeft
+			case cx >= w-rb && cy >= ht-rb:
+				return htBottomRight
+			case cy < rb:
+				return htTop
+			case cy >= ht-rb:
+				return htBottom
+			case cx < rb:
+				return htLeft
+			case cx >= w-rb:
+				return htRight
+			default:
+				return htClient
+			}
+		}
+		r, _, _ := callWndProc.Call(origProc, h, msg, wp, lp)
+		return r
+	})
+
+	p.wndProcCb = cb
+	setWndLongPtr.Call(uintptr(hwnd), gwlpWndProc, cb)
 }
 
 // ── resize ────────────────────────────────────────────────────────────────────

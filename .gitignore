@@ -1,0 +1,8 @@
+# Claude Code local memory and settings
+.claude/
+
+# Build output
+bin/
+
+# Logs
+*.log

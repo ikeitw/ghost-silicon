@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -83,13 +84,29 @@ func NewWebViewPanel(
 	p.wv = wv
 	p.log.Info("webview2 initialised")
 
+	// ── Frameless chrome ──────────────────────────────────────────────────
+	// go-webview2 creates its window with WS_OVERLAPPEDWINDOW which includes
+	// a native title bar.  Strip WS_CAPTION (keeping WS_THICKFRAME so all
+	// four edges remain resizable) and add WS_CLIPCHILDREN to prevent the
+	// window background from flashing over the WebView2 rendering surface.
+	// DwmExtendFrameIntoClientArea with a 1-px top margin restores the DWM
+	// drop-shadow and Windows 11 rounded corners.
+	wvHWND := win.HWND(uintptr(p.wv.Window()))
+	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
+	win.SetWindowLong(wvHWND, win.GWL_STYLE, wvStyle&^win.WS_CAPTION|win.WS_CLIPCHILDREN)
+	win.SetWindowPos(wvHWND, 0, 0, 0, 0, 0,
+		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+	type dwmMargins struct{ L, R, T, B int32 }
+	dwmM := dwmMargins{0, 0, 1, 0}
+	syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmExtendFrameIntoClientArea").Call(
+		uintptr(wvHWND), uintptr(unsafe.Pointer(&dwmM)))
+
 	// ── Window management bindings ────────────────────────────────────────
 	// go-webview2 always creates its own top-level window regardless of the
 	// Window option passed to NewWithOptions.  wv.Window() is that window's
 	// HWND — the one the user actually sees and interacts with.  All min/max/
 	// close operations must target it, not Walk's MainWindow HWND.
 	const swMaximize = 3 // SW_SHOWMAXIMIZED — used to detect current state
-	wvHWND := win.HWND(uintptr(p.wv.Window()))
 
 	p.wv.Bind("__ghostMinimize", func() {
 		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)

@@ -25,17 +25,42 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
+	"github.com/jchv/go-webview2/pkg/edge"
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
 )
+
+// ── Blocker wiring helpers ────────────────────────────────────────────────────
+
+// wvBrowserSlot mirrors the first 4 words of go-webview2's unexported webview
+// struct (commit dc24628cff85) so we can access the browser interface field.
+// Layout: hwnd uintptr | mainthread uintptr | browser.itab uintptr | browser.data uintptr
+type wvBrowserSlot struct {
+	_    uintptr // hwnd
+	_    uintptr // mainthread
+	_    uintptr // browser interface: type/itab pointer
+	data uintptr // browser interface: data pointer → *edge.Chromium
+}
+
+// extractChromium reads the *edge.Chromium that go-webview2 stores inside the
+// unexported webview.browser interface field.  Safe only for pinned go-webview2
+// commit dc24628cff85 — the struct layout is stable for that revision.
+func extractChromium(wv webview2.WebView) *edge.Chromium {
+	slot := (*wvBrowserSlot)(unsafe.Pointer(reflect.ValueOf(wv).Pointer()))
+	if slot.data == 0 {
+		return nil
+	}
+	return (*edge.Chromium)(unsafe.Pointer(slot.data))
+}
 
 // ── WebViewPanel ──────────────────────────────────────────────────────────────
 
@@ -158,6 +183,37 @@ func NewWebViewPanel(
 	p.wv = wv
 	p.log.Info("webview2 initialised")
 
+	// ── Ad/tracker blocker ────────────────────────────────────────────────
+	// Wire Blocker.ShouldBlock to WebResourceRequested so the badge counter
+	// reflects real blocked requests and resources are suppressed.
+	if c := extractChromium(p.wv); c != nil {
+		blocker := p.blocker
+		c.WebResourceRequestedCallback = func(
+			req *edge.ICoreWebView2WebResourceRequest,
+			args *edge.ICoreWebView2WebResourceRequestedEventArgs,
+		) {
+			uri, err := req.GetUri()
+			if err != nil || !blocker.ShouldBlock(uri) {
+				return
+			}
+			if env := c.Environment(); env != nil {
+				if resp, e2 := env.CreateWebResourceResponse(nil, 200, "OK", ""); e2 == nil {
+					_ = args.PutResponse(resp)
+				}
+			}
+		}
+		c.AddWebResourceRequestedFilter("*", edge.COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+		p.log.Info("ad/tracker blocker wired to WebResourceRequested")
+	}
+
+	// ── Download-shelf push ───────────────────────────────────────────────
+	// Whenever the download list changes, push updated JSON to the JS shelf.
+	dlMgr.onChange = func() {
+		data, _ := json.Marshal(dlMgr.All())
+		js := "if(typeof _dlPush==='function')_dlPush(" + string(data) + ");"
+		mw.Synchronize(func() { wv.Eval(js) })
+	}
+
 	// ── Frameless chrome ──────────────────────────────────────────────────
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
 	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
@@ -242,9 +298,15 @@ func NewWebViewPanel(
 	// ── Bookmark bindings ─────────────────────────────────────────────────
 	p.wv.Bind("__ghostAddBookmark", func(url, title string) {
 		_, _ = p.bookmarks.Add(url, title)
+		p.mainWindow.Synchronize(func() {
+			p.wv.Eval("if(typeof _bmBarUpdate==='function')_bmBarUpdate();")
+		})
 	})
 	p.wv.Bind("__ghostRemoveBookmark", func(url string) {
 		_ = p.bookmarks.RemoveByURL(url)
+		p.mainWindow.Synchronize(func() {
+			p.wv.Eval("if(typeof _bmBarUpdate==='function')_bmBarUpdate();")
+		})
 	})
 	p.wv.Bind("__ghostGetBookmarks", func() string {
 		data, _ := json.Marshal(p.bookmarks.All())
@@ -491,6 +553,7 @@ var H=82,profile=%q,_searchURL=%q;
 var s=document.createElement('style');
 s.id='_gs_st';
 s.textContent=
+  '#_gs_toolbar *,#_gs_bm_bar *{box-sizing:border-box!important}'+
   '#_gs_toolbar{position:fixed;top:0;left:0;right:0;height:'+H+'px;'+
   'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
   'border-bottom:1px solid rgba(255,255,255,.1);z-index:2147483647;'+
@@ -500,53 +563,92 @@ s.textContent=
   '#_gs_tablist{display:flex;align-items:flex-end;gap:2px;overflow:hidden;flex:1;min-width:0}'+
   '#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag}'+
   '._gst{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.12);border-bottom:none;'+
-  'border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex;align-items:center;'+
+  'border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex!important;align-items:center;'+
   'font-size:12px;color:rgba(255,255,255,.6);max-width:180px;min-width:80px;cursor:pointer;'+
-  '-webkit-app-region:no-drag;flex-shrink:0;'+
+  '-webkit-app-region:no-drag;flex-shrink:0!important;'+
   'transition:background .18s ease,color .18s ease,border-color .18s ease}'+
   '._gst._gst_a{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.28)}'+
   '._gst:hover:not(._gst_a){background:rgba(255,255,255,.15);color:rgba(255,255,255,.9)}'+
   '._gst>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}'+
-  '._gst_x{background:transparent;border:none;color:rgba(255,255,255,.35);font-size:11px;'+
-  'cursor:pointer;padding:0 3px;margin-left:2px;border-radius:3px;flex-shrink:0;line-height:1.5;'+
+  '._gst_x{background:transparent!important;border:none!important;color:rgba(255,255,255,.35)!important;font-size:11px!important;'+
+  'padding:0 3px!important;margin-left:2px!important;border-radius:3px!important;flex-shrink:0!important;line-height:1.5!important;'+
   'transition:background .15s ease,color .15s ease}'+
-  '._gst_x:hover{background:rgba(255,255,255,.18);color:#fff}'+
-  '._gst_fav{width:14px;height:14px;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain;'+
+  '._gst_x:hover{background:rgba(255,255,255,.18)!important;color:#fff!important}'+
+  '._gst_fav{width:14px!important;height:14px!important;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain;'+
   'transition:opacity .15s ease}'+
-  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.55);'+
-  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%%;align-self:center;line-height:1;flex-shrink:0;'+
+  '#_gs_new_tab{background:transparent!important;border:none!important;color:rgba(255,255,255,.55)!important;'+
+  'font-size:20px!important;padding:0 8px!important;border-radius:50%%!important;align-self:center!important;line-height:1!important;flex-shrink:0!important;'+
   'transition:background .15s ease,color .15s ease,transform .12s ease}'+
-  '#_gs_new_tab:hover{background:rgba(255,255,255,.14);color:#fff;transform:scale(1.12)}'+
-  '#_gs_nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}'+
-  '._gs_btn{width:28px;height:28px;border:none;background:transparent;border-radius:50%%;cursor:pointer;'+
-  'font-size:16px;color:rgba(255,255,255,.7);display:flex;align-items:center;justify-content:center;'+
+  '#_gs_new_tab:hover{background:rgba(255,255,255,.14)!important;color:#fff!important;transform:scale(1.12)}'+
+  '#_gs_nav{height:44px;display:flex!important;align-items:center!important;padding:0 10px;gap:6px}'+
+  '._gs_btn{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
+  'font-size:16px!important;color:rgba(255,255,255,.7)!important;display:flex!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;'+
   'transition:background .15s ease,color .15s ease,transform .1s ease}'+
-  '._gs_btn:hover{background:rgba(255,255,255,.14);color:#fff;transform:scale(1.1)}'+
+  '._gs_btn:hover{background:rgba(255,255,255,.14)!important;color:#fff!important;transform:scale(1.1)}'+
   '._gs_btn:active{transform:scale(.93)}'+
-  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.18);border-radius:15px;'+
-  'padding:0 14px;font-size:13px;background:rgba(255,255,255,.10);color:#fff;outline:none;'+
+  '#_gs_addr{flex:1!important;height:30px!important;border:1px solid rgba(255,255,255,.18)!important;border-radius:15px!important;'+
+  'padding:0 14px!important;font-size:13px!important;background:rgba(255,255,255,.10)!important;color:#fff!important;outline:none!important;'+
   'transition:border-color .2s ease,background .2s ease,box-shadow .2s ease}'+
   '#_gs_addr::placeholder{color:rgba(255,255,255,.35)}'+
-  '#_gs_addr:focus{border-color:rgba(130,150,255,.75);background:rgba(255,255,255,.16);'+
-  'box-shadow:0 0 0 2px rgba(130,150,255,.18)}'+
-  '#_gs_bm{width:28px;height:28px;border:none;background:transparent;border-radius:50%%;cursor:pointer;'+
-  'font-size:16px;color:rgba(255,255,255,.4);display:flex;align-items:center;justify-content:center;flex-shrink:0;'+
+  '#_gs_addr:focus{border-color:rgba(130,150,255,.75)!important;background:rgba(255,255,255,.16)!important;'+
+  'box-shadow:0 0 0 2px rgba(130,150,255,.18)!important}'+
+  '#_gs_bm{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
+  'font-size:16px!important;color:rgba(255,255,255,.4)!important;display:flex!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;'+
   'transition:background .15s ease,color .15s ease,transform .12s ease}'+
-  '#_gs_bm:hover{background:rgba(255,255,255,.13);color:#F4A460;transform:scale(1.1)}'+
-  '#_gs_bm._bm_on{color:#F4A460}'+
-  '#_gs_badge{min-width:28px;height:22px;border-radius:11px;background:rgba(244,164,96,.10);'+
-  'border:1px solid rgba(244,164,96,.22);color:rgba(244,164,96,.65);font-size:11px;font-weight:600;'+
-  'display:flex;align-items:center;justify-content:center;padding:0 5px;cursor:pointer;'+
-  'flex-shrink:0;user-select:none;transition:background .15s ease,color .15s ease}'+
-  '#_gs_badge:hover{background:rgba(244,164,96,.2);color:#F4A460}'+
-  '#_gs_wm_btns{display:flex;align-items:stretch;margin-left:auto;height:38px;-webkit-app-region:no-drag}'+
-  '._gs_wm_btn{width:46px;height:100%%;border:none;background:transparent;'+
-  'color:rgba(255,255,255,.8);font-size:13px;cursor:pointer;'+
-  'display:flex;align-items:center;justify-content:center;'+
+  '#_gs_bm:hover{background:rgba(255,255,255,.13)!important;color:#F4A460!important;transform:scale(1.1)}'+
+  '#_gs_bm._bm_on{color:#F4A460!important}'+
+  '#_gs_badge{min-width:28px!important;height:22px!important;border-radius:11px!important;background:rgba(244,164,96,.10)!important;'+
+  'border:1px solid rgba(244,164,96,.22)!important;color:rgba(244,164,96,.65)!important;font-size:11px!important;font-weight:600!important;'+
+  'display:flex!important;align-items:center!important;justify-content:center!important;padding:0 5px!important;cursor:pointer!important;'+
+  'flex-shrink:0!important;user-select:none;transition:background .15s ease,color .15s ease}'+
+  '#_gs_badge:hover{background:rgba(244,164,96,.2)!important;color:#F4A460!important}'+
+  '#_gs_wm_btns{display:flex!important;align-items:stretch!important;margin-left:auto;height:38px;-webkit-app-region:no-drag}'+
+  '._gs_wm_btn{background:transparent!important;border:none!important;width:46px!important;height:100%%!important;'+
+  'color:rgba(255,255,255,.8)!important;font-size:13px!important;'+
+  'display:flex!important;align-items:center!important;justify-content:center!important;'+
   'transition:background .15s ease,color .15s ease}'+
-  '._gs_wm_btn:hover{background:rgba(255,255,255,.18)}'+
-  '#_gs_cls:hover{background:#E81123!important;color:#fff}'+
-  'body{padding-top:'+H+'px!important}';
+  '._gs_wm_btn:hover{background:rgba(255,255,255,.18)!important}'+
+  '#_gs_cls:hover{background:#E81123!important;color:#fff!important}'+
+  'body{padding-top:'+H+'px!important}'+
+  // ── bookmark bar ───────────────────────────────────────────────────────
+  '#_gs_bm_bar{position:fixed;top:'+H+'px;left:0;right:0;height:28px;'+
+  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
+  'border-bottom:1px solid rgba(255,255,255,.08);z-index:2147483646;'+
+  'display:none;align-items:center;padding:0 10px;gap:4px;overflow:hidden}'+
+  '._gs_bmi{height:22px!important;border-radius:4px!important;padding:0 9px!important;'+
+  'background:rgba(255,255,255,.07)!important;color:rgba(255,255,255,.75)!important;font-size:12px!important;'+
+  'white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;max-width:140px!important;'+
+  'display:inline-flex!important;align-items:center!important;flex-shrink:0!important;'+
+  'transition:background .14s ease,color .14s ease}'+
+  '._gs_bmi:hover{background:rgba(255,255,255,.18)!important;color:#fff!important}'+
+  // ── download shelf ─────────────────────────────────────────────────────
+  '#_gs_dl_shelf{position:fixed;bottom:0;left:0;right:0;z-index:2147483646;'+
+  'background:rgba(18,18,44,.97);border-top:1px solid rgba(255,255,255,.1);'+
+  'transform:translateY(100%%);transition:transform .22s cubic-bezier(0.4,0,0.2,1);'+
+  'padding:10px 16px 14px;display:flex;flex-direction:column;gap:6px;'+
+  'max-height:220px;overflow-y:auto}'+
+  '._gs_dl_row{display:flex;flex-direction:column;gap:2px;padding:2px 0;'+
+  'border-bottom:1px solid rgba(255,255,255,.05)}'+
+  '._gs_dl_hdr{display:flex;align-items:center;gap:6px}'+
+  '._gs_dl_nm{font-size:12px;color:#E8E8F4;overflow:hidden;text-overflow:ellipsis;'+
+  'white-space:nowrap;flex:1;min-width:0}'+
+  '._gs_dl_stat{font-size:11px;color:rgba(255,255,255,.45);flex-shrink:0}'+
+  '._gs_dl_trk{height:3px;background:rgba(255,255,255,.1);border-radius:2px;'+
+  'overflow:hidden;margin-top:3px}'+
+  '._gs_dl_fill{height:100%%;background:linear-gradient(90deg,#7B61FF,#B89CFF);'+
+  'border-radius:2px;transition:width .4s ease}'+
+  '#_gs_dl_hdr_row{display:flex;justify-content:space-between;align-items:center;'+
+  'padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:4px}'+
+  '#_gs_dl_title{font-size:12px;font-weight:600;color:rgba(255,255,255,.7)}'+
+  '#_gs_dl_x{background:transparent;border:none;color:rgba(255,255,255,.4);'+
+  'font-size:13px;cursor:pointer;padding:0 4px;border-radius:3px;'+
+  'transition:color .12s ease}'+
+  '#_gs_dl_x:hover{color:#fff}'+
+  // ── download button in nav ─────────────────────────────────────────────
+  '#_gs_dl_btn{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
+  'font-size:14px!important;color:rgba(255,255,255,.6)!important;display:flex!important;align-items:center!important;'+
+  'justify-content:center!important;flex-shrink:0!important;transition:background .15s ease,color .15s ease}'+
+  '#_gs_dl_btn:hover{background:rgba(255,255,255,.14)!important;color:#fff!important}';
 
 /* ── Toolbar element ────────────────────────────────────────── */
 var bar=document.createElement('div');
@@ -569,6 +671,7 @@ bar.innerHTML=
   '<input id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>'+
   '<button id="_gs_bm" title="Bookmark (Ctrl+D)">☆</button>'+
   '<div id="_gs_badge" title="Blocked trackers">0</div>'+
+  '<button id="_gs_dl_btn" title="Downloads">&#8595;</button>'+
   '</div>';
 
 bar.style.cssText=
@@ -584,6 +687,59 @@ var _addr=bar.querySelector('#_gs_addr');
 var _tabTitle=bar.querySelector('#_gs_tab_title');
 var _bmEl=bar.querySelector('#_gs_bm');
 var _badgeEl=bar.querySelector('#_gs_badge');
+var _dlBtn=bar.querySelector('#_gs_dl_btn');
+
+/* ── Lock button sizes as inline !important — beats any page CSS ─ */
+(function(){
+  var I='important';
+  function _lock(el,w,h){
+    if(!el)return;
+    el.style.setProperty('width',w,I);
+    el.style.setProperty('height',h,I);
+    el.style.setProperty('min-width','0',I);
+    el.style.setProperty('min-height','0',I);
+    el.style.setProperty('max-width','none',I);
+    el.style.setProperty('max-height','none',I);
+    el.style.setProperty('background','transparent',I);
+    el.style.setProperty('border','none',I);
+    el.style.setProperty('padding','0',I);
+    el.style.setProperty('display','flex',I);
+    el.style.setProperty('align-items','center',I);
+    el.style.setProperty('justify-content','center',I);
+    el.style.setProperty('flex-shrink','0',I);
+  }
+  _lock(bar.querySelector('#_gs_back'),'28px','28px');
+  _lock(bar.querySelector('#_gs_fwd'),'28px','28px');
+  _lock(bar.querySelector('#_gs_reload'),'28px','28px');
+  _lock(_bmEl,'28px','28px');
+  _lock(_dlBtn,'28px','28px');
+  _lock(bar.querySelector('#_gs_new_tab'),'32px','32px');
+  bar.querySelectorAll('._gs_wm_btn').forEach(function(b){
+    b.style.setProperty('width','46px',I);
+    b.style.setProperty('height','100%%',I);
+    b.style.setProperty('background','transparent',I);
+    b.style.setProperty('border','none',I);
+    b.style.setProperty('padding','0',I);
+    b.style.setProperty('display','flex',I);
+    b.style.setProperty('align-items','center',I);
+    b.style.setProperty('justify-content','center',I);
+    b.style.setProperty('flex-shrink','0',I);
+  });
+  _addr.style.setProperty('flex','1',I);
+  _addr.style.setProperty('height','30px',I);
+  _addr.style.setProperty('min-width','0',I);
+})();
+
+/* ── Bookmark bar (separate fixed element below toolbar) ────── */
+var _bmBar=document.createElement('div');_bmBar.id='_gs_bm_bar';
+var _HBM=28,_bmBarOn=false;
+
+/* ── Download shelf (slides up from bottom) ─────────────────── */
+var _dlShelf=document.createElement('div');_dlShelf.id='_gs_dl_shelf';
+_dlShelf.innerHTML=
+  '<div id="_gs_dl_hdr_row">'+
+  '<span id="_gs_dl_title">Downloads</span>'+
+  '<button id="_gs_dl_x" title="Close">&#10005;</button></div>';
 
 /* ── Tab state ──────────────────────────────────────────────── */
 var _T={tabs:[],current:0};var _loaded=false;var _loadQ=[];
@@ -697,6 +853,16 @@ window._gsNewTab=function(){
   _ghostGoTo('ghost://newtab');
 };
 window._gsCloseCurrentTab=function(){_closeTab(_T.current);};
+// Opens url in a new tab — used by window.open override and target=_blank intercept.
+window._gsOpenInNewTab=function(url){
+  if(!url||url.startsWith('javascript:'))return;
+  if(!_loaded){_load(function(){window._gsOpenInNewTab(url);});return;}
+  _updateCur();
+  var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
+  var id=mx+1;_T.tabs.push({id:id,url:url,title:'New Tab'});
+  _T.current=id;_save();_render();
+  _ghostGoTo(url);
+};
 function _closeTab(id){
   if(_T.tabs.length<=1){try{__ghostClose();}catch(_){}return;}
   var idx=-1;for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){idx=i;break;}}
@@ -777,6 +943,137 @@ function _badgeUpdate(){
 }
 _badgeEl.addEventListener('click',function(){console.log('[ghost] badge clicked');_ghostGoTo('ghost://privacy');});
 setInterval(_badgeUpdate,2000);
+
+/* ── Bookmark bar ────────────────────────────────────────────── */
+function _bmBarUpdate(){
+  try{__ghostGetBookmarks().then(function(s){
+    var bms;try{bms=JSON.parse(s||'[]');}catch(_){bms=[];}
+    _bmBar.innerHTML='';
+    if(bms&&bms.length){
+      bms.forEach(function(bm){
+        var a=document.createElement('button');a.className='_gs_bmi';
+        a.textContent=bm.title||bm.url;a.title=bm.url;
+        a.addEventListener('click',function(){_ghostGoTo(bm.url);});
+        _bmBar.appendChild(a);
+      });
+      if(!_bmBarOn){
+        _bmBarOn=true;_bmBar.style.display='flex';
+        try{if(document.body)document.body.style.setProperty('padding-top',(H+_HBM)+'px','important');}catch(_){}
+      }
+    }else{
+      if(_bmBarOn){
+        _bmBarOn=false;_bmBar.style.display='none';
+        try{if(document.body)document.body.style.setProperty('padding-top',H+'px','important');}catch(_){}
+      }
+    }
+  });}catch(_){}
+}
+
+/* ── Download shelf ──────────────────────────────────────────── */
+function _dlMountShelf(){
+  if(!document.getElementById('_gs_dl_shelf')){
+    try{document.documentElement.appendChild(_dlShelf);}catch(_){return;}
+    var x=document.getElementById('_gs_dl_x');
+    if(x)x.addEventListener('click',function(){_dlClose();});
+  }
+}
+function _dlOpen(){
+  _dlMountShelf();
+  _dlShelf.style.transform='translateY(0)';
+  if(_dlBtn)_dlBtn.style.color='#7B61FF';
+}
+function _dlClose(){
+  _dlShelf.style.transform='translateY(100%%)';
+  if(_dlBtn)_dlBtn.style.color='';
+}
+window._gsDlClose=_dlClose;
+function _dlPush(items){
+  _dlMountShelf();
+  if(!items||!items.length){setTimeout(_dlClose,1500);return;}
+  // Re-render all rows after the header
+  var hdr=document.getElementById('_gs_dl_hdr_row');
+  while(_dlShelf.lastChild&&_dlShelf.lastChild!==hdr)_dlShelf.removeChild(_dlShelf.lastChild);
+  var hasActive=false;
+  items.forEach(function(it){
+    if(it.State===0)hasActive=true;
+    var row=document.createElement('div');row.className='_gs_dl_row';
+    var pct=it.TotalBytes>0?Math.round(it.RecvBytes/it.TotalBytes*100):0;
+    var fname=it.Filename||(it.URL||'').split('/').pop()||'download';
+    var st=it.State===0?(pct+'%%'):it.State===1?'Done':it.State===2?'Failed':'Cancelled';
+    row.innerHTML=
+      '<div class="_gs_dl_hdr"><span class="_gs_dl_nm">'+fname+'</span>'+
+      '<span class="_gs_dl_stat">'+st+'</span></div>'+
+      (it.State===0?
+        '<div class="_gs_dl_trk"><div class="_gs_dl_fill" style="width:'+pct+'%%"></div></div>':
+        '');
+    _dlShelf.appendChild(row);
+  });
+  _dlOpen();
+  if(!hasActive){setTimeout(_dlClose,4000);}
+}
+_dlBtn.addEventListener('click',function(){
+  if(_dlShelf.style.transform==='translateY(0)'){_dlClose();}
+  else{
+    try{__ghostGetDownloads().then(function(j){_dlPush(JSON.parse(j));});}
+    catch(_){_dlOpen();}
+  }
+});
+
+/* ── Tab drag-and-drop ───────────────────────────────────────── */
+var _dg={on:false,el:null,ghost:null,fi:0,ti:0,moved:false,startX:0,pid:0};
+_tablist.addEventListener('pointerdown',function(e){
+  if(e.button!==0)return;
+  var el=e.target.closest('._gst');
+  if(!el||e.target.closest('._gst_x'))return;
+  var kids=Array.from(_tablist.children);
+  var fi=kids.indexOf(el);if(fi<0)return;
+  _dg.on=true;_dg.el=el;_dg.fi=fi;_dg.ti=fi;_dg.moved=false;
+  _dg.ghost=null;_dg.startX=e.clientX;_dg.pid=e.pointerId;
+},true);
+_tablist.addEventListener('pointermove',function(e){
+  if(!_dg.on||!_dg.el)return;
+  if(!_dg.moved&&Math.abs(e.clientX-_dg.startX)<5)return;
+  if(!_dg.moved){
+    _dg.moved=true;
+    _dg.el.setPointerCapture(_dg.pid);
+    var r=_dg.el.getBoundingClientRect();
+    var g=_dg.el.cloneNode(true);
+    g.style.cssText+='position:fixed;z-index:2147483648;opacity:.8;pointer-events:none;'+
+      'width:'+r.width+'px;left:'+(e.clientX-r.width/2)+'px;top:'+r.top+'px;margin:0;';
+    try{document.documentElement.appendChild(g);}catch(_){}
+    _dg.ghost=g;_dg.el.style.opacity='0.3';
+  }
+  if(_dg.ghost)_dg.ghost.style.left=(e.clientX-_dg.ghost.offsetWidth/2)+'px';
+  var kids=Array.from(_tablist.children);
+  for(var i=0;i<kids.length;i++){
+    if(kids[i]===_dg.el)continue;
+    var r2=kids[i].getBoundingClientRect();
+    if(e.clientX>=r2.left&&e.clientX<r2.right&&i!==_dg.ti){
+      if(i<_dg.ti){_tablist.insertBefore(_dg.el,kids[i]);}
+      else{_tablist.insertBefore(_dg.el,kids[i].nextSibling||null);}
+      _dg.ti=i;break;
+    }
+  }
+},true);
+function _dgEnd(){
+  if(!_dg.on)return;
+  var moved=_dg.moved,fi=_dg.fi,ti=_dg.ti;
+  _dg.on=false;_dg.moved=false;
+  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
+  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
+  if(moved&&fi!==ti){
+    var t=_T.tabs.splice(fi,1)[0];
+    _T.tabs.splice(ti,0,t);
+    _render();_save();
+  }
+}
+_tablist.addEventListener('pointerup',_dgEnd,true);
+_tablist.addEventListener('pointercancel',function(){
+  if(!_dg.on)return;
+  _dg.on=false;_dg.moved=false;
+  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
+  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
+},true);
 
 /* ── Title watcher ──────────────────────────────────────────── */
 var _titleWatched=false;
@@ -930,6 +1227,30 @@ document.addEventListener('keydown',function(e){
   }
 },true);
 
+/* ── New-window intercept: keep target=_blank inside our tabs ── */
+// WebView2 fires NewWindowRequested for window.open() and target=_blank;
+// without a native handler it spawns a raw OS window. We intercept both at
+// the JS layer so all new-window requests stay inside the tab strip.
+(function(){
+  var _wo=window.open;
+  window.open=function(url,name,feat){
+    if(url&&typeof url==='string'&&!url.startsWith('javascript:')){
+      _ghostGoTo(url);
+      return window;
+    }
+    return _wo?_wo.apply(this,arguments):null;
+  };
+})();
+document.addEventListener('click',function(e){
+  var a=e.target.closest('a[target]');
+  if(!a||!a.href)return;
+  var t=(a.getAttribute('target')||'').toLowerCase();
+  if(t!=='_blank'&&t!=='_new'&&t!=='blank')return;
+  try{if(new URL(a.href).pathname===location.pathname&&a.href.includes('#'))return;}catch(_){}
+  e.preventDefault();e.stopPropagation();
+  _ghostGoTo(a.href);
+},true);
+
 /* ── Download click intercept ───────────────────────────────── */
 document.addEventListener('click',function(e){
   var a=e.target.closest('a[download]');
@@ -954,7 +1275,7 @@ function mount(){
   bar.style.setProperty('display','flex','important');
   bar.style.setProperty('flex-direction','column','important');
   try{
-    if(document.body)document.body.style.setProperty('padding-top',H+'px','important');
+    if(document.body)document.body.style.setProperty('padding-top',(H+(_bmBarOn?_HBM:0))+'px','important');
   }catch(_){}
   if(!document.getElementById('_gs_toolbar')){
     try{document.documentElement.appendChild(bar);}catch(_){return;}
@@ -967,6 +1288,11 @@ function mount(){
     }else{
       _render();
     }
+  }
+  // Bookmark bar: mount once, then let _bmBarUpdate control visibility
+  if(!document.getElementById('_gs_bm_bar')){
+    try{document.documentElement.appendChild(_bmBar);}catch(_){}
+    _bmBarUpdate();
   }
 }
 
@@ -981,6 +1307,7 @@ window.addEventListener('load',function(){
   }catch(_){}
   _bmUpdate();
   _badgeUpdate();
+  _bmBarUpdate();
 });
 window.addEventListener('popstate',function(){_addr.value=_url();_updateCur();_save();});
 

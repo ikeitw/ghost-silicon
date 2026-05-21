@@ -180,7 +180,7 @@ func (w *Window) Open() error {
 		"pipe", w.opts.PipeName,
 		"version", version.Version,
 	)
-	w.webview.Navigate(defaultHomeURL)
+	w.webview.Navigate(w.webview.InitialURL())
 
 	// ── Message loop ──────────────────────────────────────────────────────
 	_ = ctx // reserved for future goroutines owned by Window

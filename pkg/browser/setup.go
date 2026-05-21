@@ -22,8 +22,10 @@ import (
 
 // SetupResult is returned by RunSetupWizard.
 type SetupResult struct {
-	Profile         *identity.Profile
-	SearchEngineURL string
+	Profile           *identity.Profile
+	SearchEngineURL   string
+	BrowserProfileID  string
+	BrowserProfileDir string
 }
 
 // ── preset tables ─────────────────────────────────────────────────────────────
@@ -174,6 +176,11 @@ var wizardBrowserPresets = []setupBrowserPreset{
 // ── wizard window ─────────────────────────────────────────────────────────────
 
 type wizardChoice struct {
+	// Profile fields — one of ProfileID (resume) or ProfileName (new).
+	ProfileID   string `json:"profileID"`
+	ProfileName string `json:"profileName"`
+	IsResume    bool   `json:"isResume"`
+	// Identity fields — only used when IsResume is false.
 	OSPreset        int    `json:"osPreset"`
 	GPUPreset       int    `json:"gpuPreset"`
 	BrowserPreset   int    `json:"browserPreset"`
@@ -183,16 +190,18 @@ type wizardChoice struct {
 }
 
 type setupWin struct {
-	wv     webview2.WebView
-	hwnd   win.HWND
-	choice *wizardChoice
-	cbPtr  uintptr
+	wv       webview2.WebView
+	hwnd     win.HWND
+	choice   *wizardChoice
+	cbPtr    uintptr
+	profiles *BrowserProfileStore
 }
 
 // RunSetupWizard opens the identity-setup wizard and blocks until the user
 // clicks Launch or closes the window. Returns nil if the user cancelled.
-func RunSetupWizard(userDataDir string) (*SetupResult, error) {
-	sw := &setupWin{}
+// profiles is used to list existing accounts and create/load them.
+func RunSetupWizard(userDataDir string, profiles *BrowserProfileStore) (*SetupResult, error) {
+	sw := &setupWin{profiles: profiles}
 	return sw.run(userDataDir)
 }
 
@@ -247,7 +256,7 @@ func (sw *setupWin) run(userDataDir string) (*SetupResult, error) {
 		win.PostMessage(sw.hwnd, win.WM_NCLBUTTONDOWN, win.HTCAPTION, lp)
 	})
 
-	// ── Launch binding ────────────────────────────────────────────────────
+	// ── Launch binding (new profile) ─────────────────────────────────────
 	wv.Bind("__setupDone", func(jsonStr string) {
 		var ch wizardChoice
 		if err := json.Unmarshal([]byte(jsonStr), &ch); err == nil {
@@ -256,7 +265,29 @@ func (sw *setupWin) run(userDataDir string) (*SetupResult, error) {
 		win.PostMessage(sw.hwnd, win.WM_CLOSE, 0, 0)
 	})
 
-	html := setupPageHTML()
+	// ── Resume binding (existing profile) ────────────────────────────────
+	wv.Bind("__setupResume", func(id string) {
+		sw.choice = &wizardChoice{ProfileID: id, IsResume: true}
+		win.PostMessage(sw.hwnd, win.WM_CLOSE, 0, 0)
+	})
+
+	// ── Delete / Rename bindings ──────────────────────────────────────────
+	wv.Bind("__setupDeleteProfile", func(id string) {
+		if sw.profiles != nil {
+			_ = sw.profiles.Delete(id)
+		}
+	})
+	wv.Bind("__setupRenameProfile", func(id, name string) {
+		if sw.profiles != nil {
+			_ = sw.profiles.Rename(id, strings.TrimSpace(name))
+		}
+	})
+
+	var existingProfiles []*BrowserProfile
+	if sw.profiles != nil {
+		existingProfiles, _ = sw.profiles.List()
+	}
+	html := setupPageHTML(existingProfiles)
 	wv.Navigate("data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html)))
 	wv.Run()
 	wv.Destroy()
@@ -264,7 +295,7 @@ func (sw *setupWin) run(userDataDir string) (*SetupResult, error) {
 	if sw.choice == nil {
 		return nil, nil
 	}
-	return buildSetupResult(sw.choice), nil
+	return sw.buildResult(sw.choice)
 }
 
 func (sw *setupWin) subclassWndProc() {
@@ -298,7 +329,55 @@ func (sw *setupWin) subclassWndProc() {
 
 // ── result builder ────────────────────────────────────────────────────────────
 
-func buildSetupResult(ch *wizardChoice) *SetupResult {
+// buildResult converts a wizard choice into a SetupResult, creating or loading
+// the browser profile as needed.
+func (sw *setupWin) buildResult(ch *wizardChoice) (*SetupResult, error) {
+	store := sw.profiles
+
+	if ch.IsResume && store != nil {
+		// ── Resume existing profile ───────────────────────────────────────
+		bp, err := store.Load(ch.ProfileID)
+		if err != nil {
+			return nil, fmt.Errorf("load browser profile: %w", err)
+		}
+		ident, err := store.LoadIdentity(ch.ProfileID)
+		if err != nil {
+			// Fall back to a template if no identity was saved yet.
+			ident = identity.Windows11DesktopTemplate()
+		}
+		if err := store.EnsureDir(ch.ProfileID); err != nil {
+			return nil, err
+		}
+		store.Touch(ch.ProfileID, "")
+		return &SetupResult{
+			Profile:           ident,
+			SearchEngineURL:   bp.SearchEngineURL,
+			BrowserProfileID:  bp.ID,
+			BrowserProfileDir: store.Dir(bp.ID),
+		}, nil
+	}
+
+	// ── New profile ───────────────────────────────────────────────────────
+	result := buildIdentityResult(ch)
+
+	if store != nil {
+		name := strings.TrimSpace(ch.ProfileName)
+		if name == "" {
+			name = "My Profile"
+		}
+		bp, err := store.Create(name, result.SearchEngineURL)
+		if err != nil {
+			return nil, fmt.Errorf("create browser profile: %w", err)
+		}
+		_ = store.SaveIdentity(bp.ID, result.Profile)
+		result.BrowserProfileID = bp.ID
+		result.BrowserProfileDir = store.Dir(bp.ID)
+	}
+	return result, nil
+}
+
+// buildIdentityResult builds a SetupResult from the identity-wizard fields.
+func buildIdentityResult(ch *wizardChoice) *SetupResult {
 	now := time.Now().UTC()
 
 	osIdx := clampIdx(ch.OSPreset, len(wizardOSPresets))
@@ -417,7 +496,7 @@ func languageList(primary string) []string {
 
 // ── HTML ──────────────────────────────────────────────────────────────────────
 
-func setupPageHTML() string {
+func setupPageHTML(existing []*BrowserProfile) string {
 	var osOpts, gpuOpts, brOpts strings.Builder
 	for i, p := range wizardOSPresets {
 		fmt.Fprintf(&osOpts, `<option value="%d">%s</option>`, i, p.Label)
@@ -429,7 +508,7 @@ func setupPageHTML() string {
 		fmt.Fprintf(&brOpts, `<option value="%d">%s</option>`, i, p.Label)
 	}
 
-	// Build per-browser default search engine map for JS auto-select
+	// Build per-browser default search engine map for JS auto-select.
 	var seMap strings.Builder
 	seMap.WriteString("{")
 	for i, p := range wizardBrowserPresets {
@@ -440,10 +519,27 @@ func setupPageHTML() string {
 	}
 	seMap.WriteString("}")
 
+	// Serialize existing profiles as a JSON array for the profile picker.
+	type profileItem struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		LastUsed string `json:"lastUsed"`
+	}
+	items := make([]profileItem, 0, len(existing))
+	for _, p := range existing {
+		items = append(items, profileItem{
+			ID:       p.ID,
+			Name:     p.Name,
+			LastUsed: p.LastUsed.Format("Jan 2, 2006"),
+		})
+	}
+	profilesJSON, _ := json.Marshal(items)
+
 	page := strings.ReplaceAll(setupPageTemplate, "{{OS_OPTIONS}}", osOpts.String())
 	page = strings.ReplaceAll(page, "{{GPU_OPTIONS}}", gpuOpts.String())
 	page = strings.ReplaceAll(page, "{{BROWSER_OPTIONS}}", brOpts.String())
 	page = strings.ReplaceAll(page, "{{SE_MAP}}", seMap.String())
+	page = strings.ReplaceAll(page, "{{PROFILES_JSON}}", string(profilesJSON))
 	return page
 }
 
@@ -525,6 +621,43 @@ body{
 .field select:focus{border-color:rgba(160,128,255,.55);background-color:rgba(255,255,255,.1)}
 .field select option{background:#12103a;color:#E8E8F4}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.pcard{
+  display:flex;align-items:center;gap:8px;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);
+  border-radius:8px;padding:10px 14px;margin-bottom:7px;cursor:default;
+  transition:background .15s ease,opacity .18s ease,transform .18s ease;
+}
+.pcard:hover{background:rgba(255,255,255,.1)}
+.pcard-name{font-size:13px;font-weight:600;flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcard-date{font-size:11px;color:rgba(255,255,255,.35);flex-shrink:0}
+.pcard-icon{
+  border:none;background:transparent;color:rgba(255,255,255,.3);
+  font-size:13px;cursor:pointer;padding:4px 5px;border-radius:4px;
+  flex-shrink:0;line-height:1;
+  transition:background .14s ease,color .14s ease;
+}
+.pcard-icon:hover{background:rgba(255,255,255,.12);color:rgba(255,255,255,.9)}
+.pcard-icon-del:hover{background:rgba(220,40,40,.28)!important;color:#ff7070!important}
+.pcard-icon-save:hover{background:rgba(40,200,100,.22)!important;color:#6dffaa!important}
+.pcard-name-input{
+  flex:1;min-width:0;background:rgba(255,255,255,.1);
+  border:1px solid rgba(160,128,255,.55);border-radius:5px;
+  color:#E8E8F4;font-size:13px;font-weight:600;font-family:inherit;
+  padding:3px 8px;outline:none;
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+.pcard-name-input:focus{border-color:rgba(160,128,255,.9);
+  box-shadow:0 0 0 2px rgba(160,128,255,.18)}
+.pcard-resume{
+  border:none;background:linear-gradient(90deg,#6A40FF,#A080FF);
+  color:#fff;font-size:12px;font-weight:600;padding:6px 14px;border-radius:6px;
+  cursor:pointer;flex-shrink:0;
+  transition:opacity .15s ease,transform .1s ease;
+}
+.pcard-resume:hover{opacity:.85}
+.pcard-resume:active{transform:scale(.96)}
+.no-profiles{font-size:12px;color:rgba(255,255,255,.35);margin-bottom:8px}
 #footer{
   flex-shrink:0;
   padding:13px 26px;
@@ -557,6 +690,17 @@ body{
   <div class="hero">
     <h1>Identity Setup</h1>
     <p>Choose the fingerprint this session will present to websites. Your real hardware stays private.</p>
+  </div>
+
+  <div class="sec" id="profile-sec">
+    <div class="sec-title">Browser Profile</div>
+    <div id="prof-cards"></div>
+    <div class="field">
+      <label>New Profile Name</label>
+      <input type="text" id="pname" placeholder="My Profile"
+        style="width:100%;padding:8px 11px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.11);border-radius:7px;color:#E8E8F4;font-size:12.5px;outline:none;"
+        onfocus="this.style.borderColor='rgba(160,128,255,.55)'" onblur="this.style.borderColor='rgba(255,255,255,.11)'"/>
+    </div>
   </div>
 
   <div class="sec">
@@ -638,22 +782,114 @@ body{
 <script>
 (function(){
   var seMap={{SE_MAP}};
-  // Drag on header
+  var profiles={{PROFILES_JSON}};
+
+  // ── Profile picker ──────────────────────────────────────────────────
+  function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+  var cards=document.getElementById('prof-cards');
+  var _plist=profiles.slice();
+
+  function _refreshEmpty(){
+    if(!_plist.length)
+      cards.innerHTML='<p class="no-profiles">No saved profiles yet — create your first one below.</p>';
+  }
+
+  function _makeCard(p){
+    var card=document.createElement('div');card.className='pcard';
+
+    var nameEl=document.createElement('span');nameEl.className='pcard-name';nameEl.textContent=p.name;
+    var dateEl=document.createElement('span');dateEl.className='pcard-date';dateEl.textContent=p.lastUsed;
+    var renBtn=document.createElement('button');renBtn.className='pcard-icon';
+    renBtn.title='Rename';renBtn.innerHTML='&#9998;';
+    var delBtn=document.createElement('button');delBtn.className='pcard-icon pcard-icon-del';
+    delBtn.title='Delete';delBtn.innerHTML='&#10006;';
+    var resBtn=document.createElement('button');resBtn.className='pcard-resume';
+    resBtn.innerHTML='Resume &#8594;';
+
+    card.appendChild(nameEl);card.appendChild(dateEl);
+    card.appendChild(renBtn);card.appendChild(delBtn);card.appendChild(resBtn);
+
+    resBtn.onclick=function(e){e.stopPropagation();doResume(p.id);};
+
+    delBtn.onclick=function(e){
+      e.stopPropagation();
+      card.style.opacity='0';card.style.transform='translateX(18px)';
+      setTimeout(function(){
+        if(card.parentNode)card.parentNode.removeChild(card);
+        _plist=_plist.filter(function(x){return x.id!==p.id;});
+        _refreshEmpty();
+        try{__setupDeleteProfile(p.id);}catch(_){}
+      },200);
+    };
+
+    function _startRename(){
+      var old=nameEl.textContent;
+      var inp=document.createElement('input');
+      inp.type='text';inp.className='pcard-name-input';inp.value=old;
+      inp.onclick=function(e){e.stopPropagation();};
+      card.replaceChild(inp,nameEl);
+      inp.focus();inp.select();
+
+      var cancelBtn=document.createElement('button');cancelBtn.className='pcard-icon';
+      cancelBtn.title='Cancel';cancelBtn.innerHTML='&#10005;';
+      renBtn.className='pcard-icon pcard-icon-save';renBtn.title='Save';renBtn.innerHTML='&#10003;';
+      renBtn.insertAdjacentElement('afterend',cancelBtn);
+
+      function _commit(){
+        var n=inp.value.trim()||old;
+        nameEl.textContent=n;p.name=n;
+        for(var i=0;i<_plist.length;i++){if(_plist[i].id===p.id){_plist[i].name=n;break;}}
+        card.replaceChild(nameEl,inp);
+        renBtn.className='pcard-icon';renBtn.title='Rename';renBtn.innerHTML='&#9998;';
+        if(cancelBtn.parentNode)cancelBtn.parentNode.removeChild(cancelBtn);
+        renBtn.onclick=function(e){e.stopPropagation();_startRename();};
+        try{__setupRenameProfile(p.id,n);}catch(_){}
+      }
+      function _cancel(){
+        card.replaceChild(nameEl,inp);
+        renBtn.className='pcard-icon';renBtn.title='Rename';renBtn.innerHTML='&#9998;';
+        if(cancelBtn.parentNode)cancelBtn.parentNode.removeChild(cancelBtn);
+        renBtn.onclick=function(e){e.stopPropagation();_startRename();};
+      }
+      renBtn.onclick=function(e){e.stopPropagation();_commit();};
+      cancelBtn.onclick=function(e){e.stopPropagation();_cancel();};
+      inp.onkeydown=function(e){
+        if(e.key==='Enter'){_commit();}
+        if(e.key==='Escape'){_cancel();}
+      };
+    }
+    renBtn.onclick=function(e){e.stopPropagation();_startRename();};
+
+    return card;
+  }
+
+  if(_plist.length===0){
+    cards.innerHTML='<p class="no-profiles">No saved profiles yet — create your first one below.</p>';
+  } else {
+    _plist.forEach(function(p){cards.appendChild(_makeCard(p));});
+  }
+  // ── Header drag ────────────────────────────────────────────────────
   document.getElementById('hdr').addEventListener('mousedown',function(e){
     if(e.button===0&&!e.target.closest('button')){try{__setupDrag();}catch(_){}}
   });
-  // Auto-select search engine when browser changes
+
+  // ── Auto-select search engine when browser changes ─────────────────
   document.getElementById('browser').addEventListener('change',function(){
     var url=seMap[this.value];
     if(url){document.getElementById('search').value=url;}
   });
-  // Enter key launches
+
+  // ── Enter key launches ─────────────────────────────────────────────
   document.addEventListener('keydown',function(e){
-    if(e.key==='Enter'&&!e.target.matches('select')){e.preventDefault();launch();}
+    if(e.key==='Enter'&&!e.target.matches('select,input')){e.preventDefault();launch();}
   });
 })();
+function doResume(id){try{__setupResume(id);}catch(e){console.error('doResume:',e);}}
 function launch(){
   var payload=JSON.stringify({
+    profileID:       '',
+    profileName:     document.getElementById('pname').value.trim()||'My Profile',
+    isResume:        false,
     osPreset:        parseInt(document.getElementById('os').value),
     gpuPreset:       parseInt(document.getElementById('gpu').value),
     browserPreset:   parseInt(document.getElementById('browser').value),

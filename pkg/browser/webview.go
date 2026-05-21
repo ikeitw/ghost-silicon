@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -211,7 +212,9 @@ func NewWebViewPanel(
 	})
 
 	// ── Tab state ─────────────────────────────────────────────────────────
-	p.tabsJSON = `{"tabs":[{"id":1,"url":"ghost://newtab","title":"New Tab"}],"current":1}`
+	// Load saved tab state from the profile directory (session restore).
+	p.loadTabsJSON()
+
 	// __ghostGetTabs is void: value-returning bindings don't resolve when using
 	// Walk's mw.Run() instead of wv.Run(). Go pushes data to JS by calling
 	// window.__ghostTabsCb (set by JS before invoking __ghostGetTabs) via
@@ -222,7 +225,10 @@ func NewWebViewPanel(
 			p.wv.Eval("if(window.__ghostTabsCb){var _f=window.__ghostTabsCb;window.__ghostTabsCb=null;_f(" + data + ");}")
 		})
 	})
-	p.wv.Bind("__ghostSetTabs", func(j string) { p.tabsJSON = j })
+	p.wv.Bind("__ghostSetTabs", func(j string) {
+		p.tabsJSON = j
+		go p.saveTabsJSON(j)
+	})
 
 	// ── Resize ────────────────────────────────────────────────────────────
 	p.wv.Bind("__ghostStartResize", func(ht int) {
@@ -255,6 +261,9 @@ func NewWebViewPanel(
 	p.wv.Bind("__ghostGetHistory", func() string {
 		data, _ := json.Marshal(p.browsingHist.All())
 		return string(data)
+	})
+	p.wv.Bind("__ghostDeleteHistoryEntry", func(url string) {
+		p.browsingHist.DeleteByURL(url)
 	})
 	p.wv.Bind("__ghostClearHistory", func() {
 		p.browsingHist.Clear()
@@ -375,11 +384,22 @@ func NewWebViewPanel(
 	// because p.wv.Run() is never called (Walk's mw.Run() drives the loop).
 	// Synchronize posts onto Walk's loop, which runs on the same main thread
 	// that created the WebView2 controller.
-	p.wv.Bind("__ghostGoTo", func(url string) {
+	// __ghostGoTo(url, tabsJSON) — tabsJSON is the current _T from JS, passed
+	// so we never race against a pending __ghostSetTabs goroutine updating
+	// p.tabsJSON.  JS always has the authoritative latest tab state.
+	p.wv.Bind("__ghostGoTo", func(url, tabsJSON string) {
 		if !strings.HasPrefix(url, "ghost://") {
 			return
 		}
-		dataURL := "data:text/html;base64," + p.ghostPageDataURL(url)
+		html := p.ghostPageHTML(url)
+		if tabsJSON == "" {
+			tabsJSON = p.tabsJSON
+		}
+		if tabsJSON != "" {
+			script := `<script>window.__ghostInitTabs=` + tabsJSON + `;</script>`
+			html = strings.Replace(html, "</head>", script+"</head>", 1)
+		}
+		dataURL := "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html))
 		p.mainWindow.Synchronize(func() {
 			p.wv.Navigate(dataURL)
 		})
@@ -479,42 +499,52 @@ s.textContent=
   'overflow:hidden;-webkit-app-region:drag}'+
   '#_gs_tablist{display:flex;align-items:flex-end;gap:2px;overflow:hidden;flex:1;min-width:0}'+
   '#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag}'+
-  '._gst{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.15);border-bottom:none;'+
+  '._gst{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.12);border-bottom:none;'+
   'border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex;align-items:center;'+
-  'font-size:12px;color:rgba(255,255,255,.75);max-width:180px;min-width:80px;cursor:pointer;'+
-  '-webkit-app-region:no-drag;flex-shrink:0}'+
-  '._gst._gst_a{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.25)}'+
-  '._gst:hover{background:rgba(255,255,255,.16)}'+
+  'font-size:12px;color:rgba(255,255,255,.6);max-width:180px;min-width:80px;cursor:pointer;'+
+  '-webkit-app-region:no-drag;flex-shrink:0;'+
+  'transition:background .18s ease,color .18s ease,border-color .18s ease}'+
+  '._gst._gst_a{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.28)}'+
+  '._gst:hover:not(._gst_a){background:rgba(255,255,255,.15);color:rgba(255,255,255,.9)}'+
   '._gst>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}'+
-  '._gst_x{background:transparent;border:none;color:rgba(255,255,255,.4);font-size:11px;'+
-  'cursor:pointer;padding:0 3px;margin-left:2px;border-radius:3px;flex-shrink:0;line-height:1.5}'+
-  '._gst_x:hover{background:rgba(255,255,255,.2);color:#fff}'+
-  '._gst_fav{width:14px;height:14px;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain}'+
-  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.6);'+
-  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%%;align-self:center;line-height:1;flex-shrink:0}'+
-  '#_gs_new_tab:hover{background:rgba(255,255,255,.15);color:#fff}'+
+  '._gst_x{background:transparent;border:none;color:rgba(255,255,255,.35);font-size:11px;'+
+  'cursor:pointer;padding:0 3px;margin-left:2px;border-radius:3px;flex-shrink:0;line-height:1.5;'+
+  'transition:background .15s ease,color .15s ease}'+
+  '._gst_x:hover{background:rgba(255,255,255,.18);color:#fff}'+
+  '._gst_fav{width:14px;height:14px;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain;'+
+  'transition:opacity .15s ease}'+
+  '#_gs_new_tab{background:transparent;border:none;color:rgba(255,255,255,.55);'+
+  'font-size:20px;cursor:pointer;padding:0 8px;border-radius:50%%;align-self:center;line-height:1;flex-shrink:0;'+
+  'transition:background .15s ease,color .15s ease,transform .12s ease}'+
+  '#_gs_new_tab:hover{background:rgba(255,255,255,.14);color:#fff;transform:scale(1.12)}'+
   '#_gs_nav{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}'+
   '._gs_btn{width:28px;height:28px;border:none;background:transparent;border-radius:50%%;cursor:pointer;'+
-  'font-size:16px;color:rgba(255,255,255,.8);display:flex;align-items:center;justify-content:center}'+
-  '._gs_btn:hover{background:rgba(255,255,255,.15);color:#fff}'+
-  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.2);border-radius:15px;'+
-  'padding:0 14px;font-size:13px;background:rgba(255,255,255,.12);color:#fff;outline:none}'+
-  '#_gs_addr::placeholder{color:rgba(255,255,255,.4)}'+
-  '#_gs_addr:focus{border-color:rgba(130,150,255,.8);background:rgba(255,255,255,.18)}'+
+  'font-size:16px;color:rgba(255,255,255,.7);display:flex;align-items:center;justify-content:center;'+
+  'transition:background .15s ease,color .15s ease,transform .1s ease}'+
+  '._gs_btn:hover{background:rgba(255,255,255,.14);color:#fff;transform:scale(1.1)}'+
+  '._gs_btn:active{transform:scale(.93)}'+
+  '#_gs_addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.18);border-radius:15px;'+
+  'padding:0 14px;font-size:13px;background:rgba(255,255,255,.10);color:#fff;outline:none;'+
+  'transition:border-color .2s ease,background .2s ease,box-shadow .2s ease}'+
+  '#_gs_addr::placeholder{color:rgba(255,255,255,.35)}'+
+  '#_gs_addr:focus{border-color:rgba(130,150,255,.75);background:rgba(255,255,255,.16);'+
+  'box-shadow:0 0 0 2px rgba(130,150,255,.18)}'+
   '#_gs_bm{width:28px;height:28px;border:none;background:transparent;border-radius:50%%;cursor:pointer;'+
-  'font-size:16px;color:rgba(255,255,255,.45);display:flex;align-items:center;justify-content:center;flex-shrink:0}'+
-  '#_gs_bm:hover{background:rgba(255,255,255,.15);color:#F4A460}'+
+  'font-size:16px;color:rgba(255,255,255,.4);display:flex;align-items:center;justify-content:center;flex-shrink:0;'+
+  'transition:background .15s ease,color .15s ease,transform .12s ease}'+
+  '#_gs_bm:hover{background:rgba(255,255,255,.13);color:#F4A460;transform:scale(1.1)}'+
   '#_gs_bm._bm_on{color:#F4A460}'+
-  '#_gs_badge{min-width:28px;height:22px;border-radius:11px;background:rgba(244,164,96,.12);'+
-  'border:1px solid rgba(244,164,96,.25);color:rgba(244,164,96,.7);font-size:11px;font-weight:600;'+
+  '#_gs_badge{min-width:28px;height:22px;border-radius:11px;background:rgba(244,164,96,.10);'+
+  'border:1px solid rgba(244,164,96,.22);color:rgba(244,164,96,.65);font-size:11px;font-weight:600;'+
   'display:flex;align-items:center;justify-content:center;padding:0 5px;cursor:pointer;'+
-  'flex-shrink:0;user-select:none}'+
-  '#_gs_badge:hover{background:rgba(244,164,96,.22);color:#F4A460}'+
+  'flex-shrink:0;user-select:none;transition:background .15s ease,color .15s ease}'+
+  '#_gs_badge:hover{background:rgba(244,164,96,.2);color:#F4A460}'+
   '#_gs_wm_btns{display:flex;align-items:stretch;margin-left:auto;height:38px;-webkit-app-region:no-drag}'+
   '._gs_wm_btn{width:46px;height:100%%;border:none;background:transparent;'+
-  'color:rgba(255,255,255,.85);font-size:13px;cursor:pointer;'+
-  'display:flex;align-items:center;justify-content:center}'+
-  '._gs_wm_btn:hover{background:rgba(255,255,255,.2)}'+
+  'color:rgba(255,255,255,.8);font-size:13px;cursor:pointer;'+
+  'display:flex;align-items:center;justify-content:center;'+
+  'transition:background .15s ease,color .15s ease}'+
+  '._gs_wm_btn:hover{background:rgba(255,255,255,.18)}'+
   '#_gs_cls:hover{background:#E81123!important;color:#fff}'+
   'body{padding-top:'+H+'px!important}';
 
@@ -582,16 +612,42 @@ function _load(cb){
 function _save(){try{__ghostSetTabs(JSON.stringify(_T));}catch(_){}}
 function _render(){
   if(!_T.tabs||!_T.tabs.length)return;
+  var kids=_tablist.children;
+  if(kids.length===_T.tabs.length){
+    // Fast path: same number of tabs — update attributes in place, no DOM rebuild.
+    for(var i=0;i<_T.tabs.length;i++){
+      var t=_T.tabs[i];var el=kids[i];
+      var active=t.id===_T.current;
+      var wantCls=active?'_gst _gst_a':'_gst';
+      if(el.className!==wantCls)el.className=wantCls;
+      var sp=el.querySelector('span');var ttl=t.title||'New Tab';
+      if(sp&&sp.textContent!==ttl){sp.textContent=ttl;sp.title=ttl;}
+      var fav=el.querySelector('._gst_fav');
+      if(fav){
+        var http=t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'));
+        if(http){try{var h=new URL(t.url).hostname;
+          if(fav.getAttribute('data-h')!==h){
+            fav.setAttribute('data-h',h);
+            fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
+            fav.style.display='';
+            fav.onerror=function(){this.style.display='none';};
+          }
+        }catch(_){fav.style.display='none';}}
+        else{fav.style.display='none';}
+      }
+    }
+    return;
+  }
+  // Full rebuild — only runs when tab count changes (open/close).
   _tablist.innerHTML='';
   _T.tabs.forEach(function(t){
     var el=document.createElement('div');
     el.className=t.id===_T.current?'_gst _gst_a':'_gst';
-    // Favicon
     var fav=document.createElement('img');fav.className='_gst_fav';
     if(t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'))){
-      try{
-        var h=new URL(t.url).hostname;
+      try{var h=new URL(t.url).hostname;
         fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
+        fav.setAttribute('data-h',h);
         fav.onerror=function(){fav.style.display='none';};
       }catch(_){fav.style.display='none';}
     }else{fav.style.display='none';}
@@ -616,9 +672,8 @@ function _updateCur(){
 }
 /* ── Navigation helper: ghost:// goes via Go NavigateToString, http via location ─ */
 function _ghostGoTo(url){
-  console.log('[ghost] _ghostGoTo url='+url);
   if(url.startsWith('ghost://')){
-    try{__ghostGoTo(url);}catch(e){console.error('[ghost] __ghostGoTo threw:',e);}
+    try{__ghostGoTo(url,JSON.stringify(_T));}catch(e){console.error('[ghost] __ghostGoTo threw:',e);}
   }else{location.href=url;}
 }
 function _switchTab(id){
@@ -728,8 +783,16 @@ var _titleWatched=false;
 function _watchTitle(){
   if(_titleWatched)return;_titleWatched=true;
   var t=document.querySelector('title');
-  if(t){new MutationObserver(function(){_updateCur();_render();_save();})
-    .observe(t,{childList:true,characterData:true,subtree:true});}
+  if(t){new MutationObserver(function(){
+    // Only update the tab title — never the URL.
+    // Calling _updateCur() here would corrupt the target tab's URL when
+    // _T.current was already switched but the old page's title fires late.
+    var ti=document.title||location.hostname||'New Tab';
+    for(var i=0;i<_T.tabs.length;i++){
+      if(_T.tabs[i].id===_T.current){_T.tabs[i].title=ti;break;}
+    }
+    _render();
+  }).observe(t,{childList:true,characterData:true,subtree:true});}
 }
 
 /* ── Find bar (created lazily on first Ctrl+F) ──────────────── */
@@ -924,7 +987,8 @@ window.addEventListener('popstate',function(){_addr.value=_url();_updateCur();_s
 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',mount);}
 else{mount();}
 
-setInterval(function(){mount();},500);
+// Only re-mount if the toolbar was removed by the page; never re-render on a timer.
+setInterval(function(){if(!document.getElementById('_gs_toolbar'))mount();},500);
 })();`, profileName, p.searchEngineURL)
 
 	p.wv.Init(script)
@@ -999,8 +1063,10 @@ window.addEventListener('keydown',function(e){
 // async __ghostGetTabs round-trip, then returns a base64 data URL.
 func (p *WebViewPanel) ghostPageDataURL(url string) string {
 	html := p.ghostPageHTML(url)
-	script := `<script>window.__ghostInitTabs=` + p.tabsJSON + `;</script>`
-	html = strings.Replace(html, "</head>", script+"</head>", 1)
+	if p.tabsJSON != "" {
+		script := `<script>window.__ghostInitTabs=` + p.tabsJSON + `;</script>`
+		html = strings.Replace(html, "</head>", script+"</head>", 1)
+	}
 	return base64.StdEncoding.EncodeToString([]byte(html))
 }
 
@@ -1055,6 +1121,55 @@ body{font-family:'Segoe UI',system-ui,sans-serif;
 	html := strings.ReplaceAll(tmpl, "GSPAGE", page)
 	html = strings.ReplaceAll(html, "GSBODY", body)
 	return html
+}
+
+// loadTabsJSON reads the saved tab state from the profile directory.
+// Silently no-ops if the file does not exist (first launch with this profile).
+func (p *WebViewPanel) loadTabsJSON() {
+	if p.userDataDir == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(p.userDataDir, "tabs.json"))
+	if err == nil && len(data) > 0 {
+		p.tabsJSON = string(data)
+	}
+}
+
+// saveTabsJSON atomically writes the tab state to the profile directory.
+func (p *WebViewPanel) saveTabsJSON(j string) {
+	if p.userDataDir == "" {
+		return
+	}
+	path := filepath.Join(p.userDataDir, "tabs.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(j), 0o600); err == nil {
+		_ = os.Rename(tmp, path)
+	}
+}
+
+// InitialURL returns the URL the browser should navigate to on startup.
+// For session restore: returns the saved current tab's URL if it is a regular
+// web URL; falls back to ghost://newtab otherwise.
+func (p *WebViewPanel) InitialURL() string {
+	var state struct {
+		Tabs []struct {
+			ID  int    `json:"id"`
+			URL string `json:"url"`
+		} `json:"tabs"`
+		Current int `json:"current"`
+	}
+	if err := json.Unmarshal([]byte(p.tabsJSON), &state); err != nil {
+		return defaultHomeURL
+	}
+	for _, t := range state.Tabs {
+		if t.ID == state.Current {
+			if t.URL == "" || strings.HasPrefix(t.URL, "ghost://") || strings.HasPrefix(t.URL, "data:") {
+				return defaultHomeURL
+			}
+			return t.URL
+		}
+	}
+	return defaultHomeURL
 }
 
 func ghostPageBase(page, extraCSS, bodyContent string) string {
@@ -1122,12 +1237,14 @@ func (p *WebViewPanel) ghostHistoryPage() string {
 .btn{padding:8px 16px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.08);color:#ccc;font-size:13px;cursor:pointer;white-space:nowrap}
 .btn:hover{background:rgba(255,255,255,.15);color:#fff}
 .date-grp{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.4);margin:16px 0 6px}
-.he{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;cursor:pointer}
+.he{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:6px}
 .he:hover{background:rgba(255,255,255,.07)}
 .he-time{font-size:11px;color:rgba(255,255,255,.3);flex-shrink:0;width:50px;text-align:right}
-.he-info{flex:1;min-width:0}
+.he-info{flex:1;min-width:0;cursor:pointer}
 .he-title{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .he-url{font-size:11px;color:rgba(255,255,255,.4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.he-del{background:transparent;border:none;color:rgba(255,255,255,.25);font-size:11px;cursor:pointer;padding:4px 6px;border-radius:4px;flex-shrink:0;line-height:1}
+.he-del:hover{background:rgba(220,30,30,.35);color:#fff}
 .empty{text-align:center;opacity:.4;padding:40px;font-size:14px}`
 	body := `<h1>History</h1>
 <div class="toolbar">
@@ -1150,13 +1267,21 @@ function render(){
     var day=new Date(e.visited_at).toDateString();
     if(day!==lastDay){lastDay=day;var g=document.createElement('div');g.className='date-grp';g.textContent=fmtDate(e.visited_at);l.appendChild(g);}
     var d=document.createElement('div');d.className='he';
-    d.innerHTML='<span class="he-time">'+esc(fmt(e.visited_at))+'</span>'+
-      '<div class="he-info"><div class="he-title">'+esc(e.title||e.url)+'</div><div class="he-url">'+esc(e.url)+'</div></div>';
-    d.onclick=function(){location.href=e.url;};l.appendChild(d);
+    var info=document.createElement('div');info.className='he-info';
+    info.innerHTML='<div class="he-title">'+esc(e.title||e.url)+'</div><div class="he-url">'+esc(e.url)+'</div>';
+    var del=document.createElement('button');del.className='he-del';del.textContent='✕';del.title='Remove';
+    d.innerHTML='<span class="he-time">'+esc(fmt(e.visited_at))+'</span>';
+    d.appendChild(info);d.appendChild(del);
+    (function(entry,row,btn){
+      info.onclick=function(){location.href=entry.url;};
+      btn.onclick=function(ev){ev.stopPropagation();row.remove();try{__ghostDeleteHistoryEntry(entry.url);}catch(_){}};
+    })(e,d,del);
+    l.appendChild(d);
   });
 }
 document.getElementById('q').addEventListener('input',render);
 document.getElementById('clr').onclick=function(){
+  if(!confirm('Clear all history?'))return;
   __ghostClearHistory().then(refresh);
 };
 function refresh(){__ghostGetHistory().then(function(j){try{_all=JSON.parse(j)||[];}catch(_){_all=[];}render();});}

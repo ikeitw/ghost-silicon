@@ -176,6 +176,20 @@ func (s *BrowsingHistoryStore) All() []BrowsingVisit {
 	return out
 }
 
+// DeleteByURL removes all entries matching url and flushes.
+func (s *BrowsingHistoryStore) DeleteByURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keep := s.entries[:0]
+	for _, e := range s.entries {
+		if e.URL != url {
+			keep = append(keep, e)
+		}
+	}
+	s.entries = keep
+	_ = s.flushLocked()
+}
+
 // Clear removes all history and flushes.
 func (s *BrowsingHistoryStore) Clear() {
 	s.mu.Lock()

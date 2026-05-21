@@ -126,12 +126,23 @@ func run() error {
 		return fmt.Errorf("session layout: %w", err)
 	}
 
+	// ── Browser profile store ────────────────────────────────────────────
+	// Named accounts that persist tabs, history, bookmarks, and WebView2
+	// session data (cookies, localStorage) across restarts.
+	bpStore, err := browser.NewBrowserProfileStore(
+		filepath.Join(cfg.App.DataDir, "browser-profiles"),
+	)
+	if err != nil {
+		return fmt.Errorf("browser profile store: %w", err)
+	}
+
 	// ── Setup wizard (GUI mode only) ─────────────────────────────────────
 	// Always shown on launch so the user picks an identity before browsing.
 	// Headless mode skips it and uses the stored profile.
 	var searchEngineURL string
+	userDataDir := layout.Root // fallback for headless mode
 	if !*headless {
-		wizardResult, wizardErr := browser.RunSetupWizard(layout.Root)
+		wizardResult, wizardErr := browser.RunSetupWizard(layout.Root, bpStore)
 		if wizardErr != nil {
 			return fmt.Errorf("setup wizard: %w", wizardErr)
 		}
@@ -140,10 +151,14 @@ func run() error {
 		}
 		activeProfile = wizardResult.Profile
 		searchEngineURL = wizardResult.SearchEngineURL
+		if wizardResult.BrowserProfileDir != "" {
+			userDataDir = wizardResult.BrowserProfileDir
+		}
 		log.Info("setup wizard completed",
 			"profile_name", activeProfile.Name,
 			"os", activeProfile.Hardware.Platform,
 			"search_engine", searchEngineURL,
+			"profile_dir", userDataDir,
 		)
 	}
 
@@ -251,7 +266,7 @@ func run() error {
 	// ── GUI MODE ──────────────────────────────────────────────────────────
 	win, err := browser.NewWindow(browser.WindowOptions{
 		Bridge:          br,
-		UserDataDir:     layout.Root,
+		UserDataDir:     userDataDir,
 		PipeName:        cfg.IPC.PipeName,
 		SearchEngineURL: searchEngineURL,
 		Log:             log,

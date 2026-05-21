@@ -1,7 +1,9 @@
 # Process Isolation
 
-Ghost-Silicon uses Windows-native isolation primitives to restrict what the
-renderer process can do and see.
+> This document covers isolation for the **external renderer mode**
+> (`engine.executable` set in config). In the default embedded-WebView2 mode,
+> WebView2 manages its own process isolation internally via Chromium's
+> multi-process architecture.
 
 ## Isolation Stack
 
@@ -29,20 +31,28 @@ renderer process can do and see.
 └────────────────────────────────────────────────┘
 ```
 
-## Job Object Details
+## Job Object
 
 Created with `CreateJobObject` in `internal/platform/windows/jobobject`.
 
 Flags applied:
 - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills all processes in the job
-  when the last handle to the job is closed (i.e. when the supervisor exits)
+  when the last handle is closed (supervisor exit)
 - `JOB_OBJECT_LIMIT_JOB_MEMORY` — optional memory cap in bytes
-- `JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`
-  — optional CPU rate cap (units: 1/100th of a percent)
+- `JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | HARD_CAP` — optional CPU rate cap
 
 The renderer is launched with `CREATE_SUSPENDED`, assigned to the Job Object,
-then resumed via `ResumeThread`. This guarantees the process cannot escape the
-job between creation and assignment.
+then resumed via `ResumeThread`. This guarantees the process cannot escape
+the job between creation and assignment.
+
+Configure in `configs/ghost-silicon.yaml`:
+
+```yaml
+sandbox:
+  enable_job_object: true
+  memory_limit_mb: 0     # 0 = unlimited
+  cpu_rate_percent: 0    # 0 = unlimited
+```
 
 ## Token Restriction
 
@@ -50,25 +60,33 @@ Created with `DuplicateTokenEx` + `AdjustTokenPrivileges` + `SetTokenInformation
 
 Privileges removed (`SE_PRIVILEGE_REMOVED`):
 
-| Privilege                    | Why removed                             |
-|------------------------------|-----------------------------------------|
-| SeDebugPrivilege             | Cannot attach debugger to other processes |
-| SeLoadDriverPrivilege        | Cannot load kernel drivers              |
-| SeTcbPrivilege               | Cannot act as OS                        |
-| SeBackupPrivilege            | Cannot bypass file ACLs                 |
-| SeRestorePrivilege           | Cannot bypass file ACLs                 |
-| SeCreateTokenPrivilege       | Cannot forge tokens                     |
-| SeTakeOwnershipPrivilege     | Cannot seize ownership of objects       |
-| SeAssignPrimaryTokenPrivilege| Cannot swap process tokens              |
-| SeImpersonatePrivilege       | Cannot impersonate other users          |
-| SeCreateGlobalPrivilege      | Cannot create global kernel objects     |
+| Privilege | Why removed |
+|---|---|
+| `SeDebugPrivilege` | Cannot attach debugger to other processes |
+| `SeLoadDriverPrivilege` | Cannot load kernel drivers |
+| `SeTcbPrivilege` | Cannot act as OS |
+| `SeBackupPrivilege` | Cannot bypass file ACLs for reads |
+| `SeRestorePrivilege` | Cannot bypass file ACLs for writes |
+| `SeCreateTokenPrivilege` | Cannot forge tokens |
+| `SeTakeOwnershipPrivilege` | Cannot seize object ownership |
+| `SeAssignPrimaryTokenPrivilege` | Cannot swap process tokens |
+| `SeImpersonatePrivilege` | Cannot impersonate other users |
+| `SeCreateGlobalPrivilege` | Cannot create global kernel objects |
 
-Mandatory integrity level is set to Medium by default. Low integrity is
-available for maximum isolation (some features may break at Low).
+Integrity level set to Medium by default. Low is available for maximum
+isolation (some WebView2 features may break at Low).
+
+Configure:
+
+```yaml
+sandbox:
+  enable_restricted_token: true
+  integrity_level: medium   # low | medium | high
+```
 
 ## Per-Session Filesystem
 
-Directory tree created by `filesystem.CreateSessionLayout`:
+Created by `filesystem.CreateSessionLayout`:
 
 ```
 %APPDATA%\ghost-silicon\sessions\<session-id>\
@@ -83,33 +101,27 @@ Directory tree created by `filesystem.CreateSessionLayout`:
 ```
 
 ACLs applied by `filesystem.LockToCurrentUser`:
+
 ```
 SDDL: O:<SID>G:<SID>D:(A;OICI;FA;;;<SID>)
 ```
+
 Only the owning user has Full Control. Other local users cannot read
 session data.
 
 ## Optional Firewall Rules
 
-When enabled, `firewall.SessionPolicy.Apply()` creates two rules via netsh:
+When enabled, `firewall.SessionPolicy.Apply()` creates two `netsh advfirewall`
+rules:
 
 1. **Outbound allow** — permits all outbound traffic from the session
 2. **Inbound block** — blocks all non-loopback inbound connections
 
 Rules are tagged with the session ID and removed on session stop.
 
-## Linux / macOS (Phase 1)
+## Isolation Checker
 
-On Linux and macOS, Phase 1 uses a plain `exec.Cmd` launch with no additional
-isolation. Phase 2 will add:
-
-- Linux: UTS + net + mnt + user + PID namespaces via `clone(2)`, cgroup v2
-  limits, seccomp-BPF filter
-- macOS: `sandbox-exec` with a deny-default Seatbelt profile
-
-## Isolation Check
-
-Run the sandbox-checker tool before deploying:
+Run before deploying to verify prerequisites are met:
 
 ```powershell
 .\bin\sandbox-checker.exe
@@ -122,5 +134,4 @@ report := security.CheckIsolation()
 fmt.Println(report.Describe())
 ```
 
-This verifies that `CreateJobObject` and `OpenProcessToken` succeed, which
-are the two prerequisites for the full isolation stack.
+Verifies that `CreateJobObject` and `OpenProcessToken` succeed.

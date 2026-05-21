@@ -1,9 +1,29 @@
 # Renderer Adapter
 
-Ghost-Silicon does not implement a browser engine. Instead it wraps any
-Chromium-compatible renderer via the `renderer.Adapter` interface.
+## Default Mode: Embedded WebView2
 
-## Interface
+When `engine.executable` is empty (the default), Ghost-Silicon uses the
+system WebView2 runtime embedded directly via go-webview2. No separate
+renderer process is launched. The identity polyfill and HTML chrome overlay
+are injected via `AddScriptToExecuteOnDocumentCreated`.
+
+This is the recommended mode. The external adapter mechanism below exists for
+advanced use cases where a separate Chromium-compatible renderer is needed.
+
+## External Renderer Mode
+
+When `engine.executable` is set, Ghost-Silicon launches that executable as a
+separate process and connects to it over the named pipe bridge.
+
+Set in `configs/ghost-silicon.yaml`:
+
+```yaml
+engine:
+  executable: "C:\\Program Files\\Chromium\\chrome.exe"
+  args: ["--disable-extensions"]
+```
+
+## Adapter Interface
 
 ```go
 // pkg/renderer/interface.go
@@ -23,15 +43,15 @@ type Process interface {
 
 ## StartOptions
 
-| Field         | Purpose                                              |
-|---------------|------------------------------------------------------|
-| `ProfileID`   | Identity profile bound to this session               |
-| `SessionID`   | Unique session identifier                            |
-| `PipeName`    | Named pipe path for the IPC bridge                   |
-| `UserDataDir` | Isolated filesystem root for the renderer            |
-| `CacheDir`    | HTTP cache directory                                 |
-| `ExtraArgs`   | Additional command-line arguments                    |
-| `Env`         | Environment block (nil = inherit supervisor env)     |
+| Field | Purpose |
+|---|---|
+| `ProfileID` | Identity profile bound to this session |
+| `SessionID` | Unique session identifier |
+| `PipeName` | Named pipe path for the IPC bridge |
+| `UserDataDir` | Isolated filesystem root for the renderer |
+| `CacheDir` | HTTP cache directory |
+| `ExtraArgs` | Additional command-line arguments |
+| `Env` | Environment block (nil = inherit supervisor env) |
 
 ## Built-in Adapters
 
@@ -40,23 +60,20 @@ type Process interface {
 Used in tests and developer tooling. Starts immediately, reports
 `IsRunning() == true` forever, and `Wait()` returns 0 without blocking.
 
-Register name: `"mock"`
-
 ```go
 adapter.Global.Get("mock", "")
 ```
 
 ### Windows Launcher (`internal/engine/launcher`)
 
-The production Windows adapter. Calls `process.Launch()` which:
+Production adapter for external Chromium processes:
 
-1. Builds the command-line arguments via `ArgBuilder`
-2. Builds the environment block via `EnvBuilder` with `GS_SESSION_ID`,
-   `GS_PROFILE_ID`, and `GS_PIPE_NAME` injected
+1. Builds command-line args via `ArgBuilder`
+2. Builds environment block with `GS_SESSION_ID`, `GS_PROFILE_ID`, `GS_PIPE_NAME`
 3. Optionally builds a restricted token via `token.Build()`
 4. Calls `CreateProcess` / `CreateProcessAsUser` with `CREATE_SUSPENDED`
 5. Assigns the process to the Job Object
-6. Calls `ResumeThread` to start execution
+6. Calls `ResumeThread`
 
 ## Registering a Custom Adapter
 
@@ -66,20 +83,13 @@ adapter.Global.Register("chromium", func(executable string) renderer.Adapter {
 })
 ```
 
-Then set in config:
+The supervisor selects an adapter by matching the adapter name against the
+`engine.executable` config value. Unrecognised values fall back to the mock
+adapter.
 
-```yaml
-engine:
-  executable: "C:\\Program Files\\Chromium\\chrome.exe"
-```
+## Command-Line Arguments (external renderer)
 
-The supervisor selects the adapter by matching the config `engine.executable`
-field against registered adapter names. If no match is found it falls back to
-the mock adapter.
-
-## Command-Line Arguments
-
-The `ArgBuilder` in `internal/engine/launcher/args.go` appends:
+`ArgBuilder` appends:
 
 ```
 --user-data-dir=<session-root>
@@ -90,29 +100,30 @@ The `ArgBuilder` in `internal/engine/launcher/args.go` appends:
 [extra args from StartOptions]
 ```
 
-Any Chromium-compatible renderer that reads `--user-data-dir` and
-`--disk-cache-dir` will honour session isolation automatically.
+## Crash Restart
 
-The `--gs-pipe-name` flag is a ghost-silicon extension. The renderer adapter
-layer in the renderer reads it at startup and connects to the bridge.
+The `runtime.Runtime` supervise loop (external renderer only):
 
-## Health Monitoring
+1. `Process.Wait(ctx)` — blocks until exit
+2. `Restarter.RecordCrash(exitCode)` — increments counter
+3. Limit exceeded → return `ErrCrashLimitExceeded`
+4. Otherwise → `Restarter.WaitBeforeRestart(ctx)` (exponential backoff)
+5. Re-call `adapter.Start()` with the same `StartOptions`
+6. Uptime > 30 s since last restart → `Restarter.Reset()`
 
-The engine health monitor (`internal/engine/health`) polls
-`Process.IsRunning()` every 5 seconds (configurable) and emits status changes
-to a channel. The supervisor drains this channel in the health worker goroutine.
+Configure in `configs/ghost-silicon.yaml`:
+
+```yaml
+engine:
+  crash_restart_limit: 3
+  crash_restart_delay: 2s
+```
+
+## Health Monitoring (external renderer)
+
+`internal/engine/health` polls `Process.IsRunning()` every 5 seconds and
+emits status changes to a channel. The lifecycle manager drains this channel.
 
 Probes available:
 - `ProcessProbe` — checks `IsRunning()` directly
-- `HTTPProbe` — performs HTTP GET to a local health endpoint
-
-## Crash Restart
-
-The `runtime.Runtime` supervise loop:
-
-1. Calls `Process.Wait(ctx)` — blocks until exit
-2. Calls `Restarter.RecordCrash(exitCode)` — increments counter
-3. If limit exceeded: returns `ErrCrashLimitExceeded`
-4. Otherwise: calls `Restarter.WaitBeforeRestart(ctx)` (exponential backoff)
-5. Re-calls `adapter.Start()` with the same `StartOptions`
-6. If uptime > 30s since last restart: calls `Restarter.Reset()` (clears count)
+- `HTTPProbe` — HTTP GET to a local health endpoint

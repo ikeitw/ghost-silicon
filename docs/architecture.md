@@ -2,137 +2,216 @@
 
 ## Overview
 
-Ghost-Silicon is a Go-based browser supervisor. It does not implement a browser
-engine — it wraps a generic rendering engine and controls the environment that
-engine runs in.
+Ghost-Silicon is a Windows 11 privacy browser written in Go. It embeds the
+system WebView2 runtime (Chromium) and spoofs every fingerprinting API the
+engine exposes — hardware, screen geometry, GPU, fonts, canvas noise, audio
+noise — so websites see a controlled profile instead of real device values.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  Ghost-Silicon Supervisor                │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
-│  │ Identity │  │ Network  │  │ Sandbox  │  │  IPC   │  │
-│  │ Profiles │  │  Layer   │  │ Manager  │  │ Bridge │  │
-│  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
-│                                                  │       │
-└──────────────────────────────────────────────────┼───────┘
-                                                   │ Named Pipe
-                                          ┌────────┴───────┐
-                                          │ Renderer Engine │
-                                          │  (any Chromium  │
-                                          │  compatible)    │
-                                          └────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  ghost-silicon.exe                                               │
+│                                                                  │
+│  ┌──────────────┐   first run    ┌───────────────────────────┐  │
+│  │  Setup       │ ─────────────▶ │  Identity Profile         │  │
+│  │  Wizard      │                │  (OS / GPU / UA / Search) │  │
+│  └──────────────┘                └──────────┬────────────────┘  │
+│                                             │                   │
+│  ┌──────────────────────────────────────────▼───────────────┐   │
+│  │  Browser Window  (Walk MainWindow + go-webview2)         │   │
+│  │                                                          │   │
+│  │  ┌────────────────────────────────────────────────────┐  │   │
+│  │  │  WebView2 controller (fills entire client area)    │  │   │
+│  │  │                                                    │  │   │
+│  │  │  ┌──────────────────────────────────────────────┐  │  │   │
+│  │  │  │  HTML Chrome Overlay  (position:fixed)       │  │  │   │
+│  │  │  │  — tab strip, address bar, nav buttons       │  │  │   │
+│  │  │  │  — window controls (min / max / close)       │  │  │   │
+│  │  │  └──────────────────────────────────────────────┘  │  │   │
+│  │  │                                                    │  │   │
+│  │  │  ┌──────────────────────────────────────────────┐  │  │   │
+│  │  │  │  Identity Polyfill  (injected on doc create) │  │  │   │
+│  │  │  │  — overrides navigator.*, screen.*, WebGL    │  │  │   │
+│  │  │  │  — canvas / audio / font noise seeds         │  │  │   │
+│  │  │  └──────────────────────────────────────────────┘  │  │   │
+│  │  │                                                    │  │   │
+│  │  │  Web content (any site / ghost:// pages)           │  │   │
+│  │  └────────────────────────────────────────────────────┘  │   │
+│  │                                                          │   │
+│  │  Bookmarks │ History │ Downloads │ Content Blocker       │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  IPC bridge  (named pipe + JSON-RPC, for external adapters)     │
+│  Lifecycle manager  (ordered start / stop hooks)                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## Startup Sequence
+
+```
+main()
+  │
+  ├─ CLI flags (--config, --headless, --version)
+  ├─ Config discovery (exe dir → parent dir → %APPDATA%)
+  ├─ bootstrap.Run()  — logging, config, audit trail
+  ├─ storage.Migrate()
+  ├─ profile store open
+  ├─ session ID + filesystem layout created
+  │
+  ├─ [GUI mode] RunSetupWizard()
+  │     └─ User picks OS, GPU, browser UA, timezone, search engine
+  │        Returns *SetupResult{Profile, SearchEngineURL}
+  │
+  ├─ IPC bridge start  (named pipe listener + JSON-RPC server)
+  │
+  ├─ browser.NewWindow() + win.Open()
+  │     ├─ Walk MainWindow (hidden, message-loop only)
+  │     ├─ go-webview2 instance (fills screen)
+  │     ├─ Identity polyfill injected (AddScriptToExecuteOnDocumentCreated)
+  │     ├─ HTML chrome injected (AddScriptToExecuteOnDocumentCreated)
+  │     ├─ ghost:// bindings registered
+  │     └─ Navigate("ghost://newtab")
+  │
+  └─ mw.Run()  ← Walk message loop, blocks until window closed
 ```
 
 ## Core Components
 
-### Supervisor (`internal/app/supervisor`)
+### Setup Wizard (`pkg/browser/setup.go`)
 
-The top-level orchestrator. Owns one session at a time and coordinates:
-- Profile loading and rotation
-- Engine lifecycle (start, monitor, restart, stop)
-- IPC bridge wiring
-- Lifecycle hook management
+A go-webview2 window shown on every launch. The user selects:
+- **OS preset** — sets `navigator.platform`, screen dimensions, CPU cores, RAM
+- **GPU** — sets WebGL `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL`
+- **Browser identity** — sets the complete User-Agent string (OS-appropriate variant)
+- **Language / Timezone** — sets `navigator.languages` and `Intl.DateTimeFormat`
+- **Search engine** — URL prefix used when typing text in the address bar
 
-### Identity / Profile (`pkg/identity`)
+Returns a `*SetupResult{Profile *identity.Profile, SearchEngineURL string}`.
 
-Every value the renderer sees flows through a Profile. Fields:
-- `hardware` — CPU cores, GPU vendor/renderer, RAM, platform, touch points
-- `browser` — User-Agent, app version, vendor, languages, DoNotTrack
-- `screen` — width, height, availWidth, availHeight, DPR, orientation
-- `network` — timezone, proxy URL, DNS servers
-- `noise` — canvas, audio, WebGL, font seeds
-- `storage` — API enablement flags and quota caps
-- `permissions` — per-permission states (deny / prompt / grant)
+### Identity Profile (`pkg/identity`)
+
+Every value exposed to the browser engine flows through a `Profile` struct.
+The profile is created by the setup wizard and never changes during a session.
+
+Subsections:
+- `Hardware` — platform, CPU cores, RAM, GPU vendor + renderer
+- `Browser` — UserAgent, AppVersion, Vendor, ProductSub, Languages
+- `Screen` — width, height, availHeight, colorDepth, devicePixelRatio, orientation
+- `Network` — timezone
+- `Noise` — canvas, audio, WebGL, font noise seeds
+- `Storage` — API enablement flags
+- `Permissions` — per-API permission states
+
+### Identity Polyfill (`pkg/browser/webview.go` → `injectPolyfill`)
+
+Injected via `AddScriptToExecuteOnDocumentCreated`. It overrides:
+- `navigator.userAgent`, `appVersion`, `vendor`, `platform`, `hardwareConcurrency`,
+  `deviceMemory`, `languages`, `language`, `cookieEnabled`
+- `screen.width/height/availWidth/availHeight/colorDepth/pixelDepth/orientation`
+- `window.devicePixelRatio`
+- `Intl.DateTimeFormat` prototype — timezone
+- WebGL `getParameter(UNMASKED_VENDOR/RENDERER_WEBGL)`
+- `HTMLCanvasElement.toDataURL/toBlob/getImageData` — deterministic noise
+- `AudioContext.createAnalyser` / `getChannelData` — deterministic noise
+
+### HTML Chrome Overlay (`pkg/browser/webview.go` → `injectChromeOverlay`)
+
+A `position:fixed` DOM subtree injected into every page at `z-index:2147483647`.
+It implements the entire browser chrome with no Win32 child-window conflicts:
+
+- **Tab strip** — tabs stored as JSON in Go (`WebViewPanel.tabsJSON`), synced to JS
+  via `__ghostGetTabs` / `__ghostSetTabs` bindings
+- **Address bar** — converts typed text to search queries using `_searchURL`
+  (set from the wizard's search engine choice)
+- **Navigation buttons** — back, forward, reload, stop, home
+- **Window controls** — minimize, maximize/restore, close
+- **Drag region** — `WM_NCLBUTTONDOWN` via `__ghostStartDrag`
+- **Resize edges** — JS edge-proximity detection → `__ghostStartResize`
+- **Bookmarks bar** — ☆/★ toggle wired to `BookmarkStore`
+- **Context menu** — right-click menu with search, copy, inspect, etc.
+
+### ghost:// Protocol
+
+Internal pages are served as `data:text/html;base64,...` URLs.
+`WebViewPanel.ghostPageDataURL(url)` generates the HTML and injects
+`window.__ghostInitTabs` so the tab strip renders synchronously on load.
+
+| URL | Purpose |
+|---|---|
+| `ghost://newtab` | New tab / home page |
+| `ghost://settings` | Settings (placeholder) |
+
+### Browser Features
+
+| Feature | Implementation |
+|---|---|
+| Bookmarks | `BookmarkStore` (JSON file at `<session>/bookmarks.json`) |
+| History | `BrowsingHistoryStore` (JSON file at `<session>/history.json`) |
+| Downloads | `DownloadManager` (in-memory, wired to `__ghostDownloadStarted`) |
+| Content blocking | `Blocker` (host blocklist from `pkg/browser/blocklist.txt`) |
+| DevTools | `DevToolsPanel` (F12 via `ICoreWebView2.OpenDevToolsWindow`) |
+| Zoom | `WebViewPanel.SetZoom()` → `ICoreWebView2Controller.put_ZoomFactor` |
 
 ### IPC Bridge (`pkg/bridge`, `internal/ipc`)
 
-The renderer connects to the supervisor over a Windows Named Pipe and calls
-JSON-RPC methods. The bridge handlers look up values from the active Profile
-and return them. The renderer never reads host hardware directly.
+A named-pipe JSON-RPC server available for external renderer adapters.
+In normal embedded-WebView2 mode it starts but receives no traffic —
+the polyfill reads profile values directly from the injected script.
+
+The bridge is used when `engine.executable` is set in config, which launches
+a separate Chromium-compatible renderer process that connects via the pipe.
+
+### Lifecycle Manager (`internal/app/lifecycle`)
+
+Ordered start/stop hooks. Start hooks run in registration order; stop hooks
+run LIFO. Current hooks:
+
+| Name | Start | Stop |
+|---|---|---|
+| `ipc-bridge` | Open named pipe, begin serving | Close pipe listener |
+| `renderer` | Start external renderer process | Terminate + Wait |
+
+The `renderer` hook is registered only when `engine.executable` is non-empty.
+
+## Package Map
 
 ```
-JavaScript API call
-      ↓
-Renderer hardware abstraction layer
-      ↓
-Named Pipe → JSON-RPC request
-      ↓
-Bridge handler (reads Profile)
-      ↓
-Profile-backed response
-```
-
-### Network Layer (`pkg/network`)
-
-A custom `http.RoundTripper` wraps all renderer outbound traffic:
-- Host ACL (allowlist / blocklist with wildcard support)
-- Proxy routing (HTTP, HTTPS, SOCKS5)
-- DNS override
-- Header policy (strip internal headers, inject Accept-Language)
-- TLS policy (minimum TLS 1.2)
-- Connection pool management
-
-### Sandbox (`internal/platform/windows`, `pkg/sandbox`)
-
-Windows-first isolation using:
-- **Job Objects** — groups all renderer child processes; kill-on-close prevents
-  orphaned processes surviving the supervisor
-- **Restricted tokens** — removes dangerous privileges; sets medium integrity
-- **Per-session filesystem** — each session gets an isolated directory tree
-  under `%APPDATA%\ghost-silicon\sessions\<session-id>\`
-- **Firewall rules** — optional per-session Windows Firewall rules (netsh)
-
-### Telemetry (`internal/telemetry`)
-
-- Structured logging via `log/slog` (text or JSON format)
-- In-process metrics (counters, histograms)
-- Lightweight span tracing
-- Append-only NDJSON audit log for security events
-
-## Data Flow
-
-```
-Startup
-  │
-  ├─ Load config (YAML + env overrides)
-  ├─ Run storage migrations
-  ├─ Open profile store
-  ├─ Load or generate active profile
-  ├─ Create session ID
-  ├─ Create session directory layout
-  │
-  ├─ Start IPC bridge (named pipe + JSON-RPC server)
-  ├─ Launch renderer (Job Object + restricted token)
-  │
-  └─ Block until OS signal
-       │
-       └─ Graceful shutdown (LIFO hook order)
-```
-
-## Package Dependency Graph
-
-```
-cmd/ghost-silicon
-  └── internal/app/bootstrap
-        ├── internal/config/loader
-        ├── internal/config/validation
-        ├── internal/telemetry/logging
-        ├── internal/telemetry/audit
-        └── internal/app/supervisor
-              ├── pkg/identity
-              ├── pkg/bridge
-              │     └── internal/ipc/jsonrpc
-              ├── pkg/network
-              ├── internal/engine/runtime
-              │     └── internal/platform/windows/...
-              └── internal/app/lifecycle
+cmd/ghost-silicon/           — entry point, startup sequence
+pkg/
+  browser/                   — browser window, WebView2, chrome overlay,
+  │                            setup wizard, bookmarks, history, downloads
+  bridge/                    — profile → IPC handler wiring
+  identity/                  — Profile struct, templates, store, validation
+  renderer/                  — StartOptions, Adapter interface
+  storage/                   — migrations, profile store, session store
+  version/                   — version string
+internal/
+  app/
+    bootstrap/               — logging + config init
+    lifecycle/               — ordered hook manager
+    shutdown/                — signal handler
+  config/                    — YAML loader + validation
+  engine/
+    adapter/                 — adapter registry + mock
+    runtime/                 — crash-restart supervise loop
+  ipc/
+    jsonrpc/                 — JSON-RPC 2.0 codec + server
+    namedpipe/               — Windows named pipe listener
+  platform/windows/
+    filesystem/              — per-session directory layout
+    process/                 — process launch, job object, token restriction
+  telemetry/
+    logging/                 — structured logger (log/slog)
+    audit/                   — NDJSON audit trail
 ```
 
 ## Thread Safety
 
-- `identity.FileStore` — all methods protected by `sync.RWMutex`
-- `bridge.Bridge` — profile pointer swapped atomically via `UpdateProfile`
-- `jsonrpc.Server` — handlers called concurrently; each handler is stateless
-- `audit.Logger` — writes protected by `sync.Mutex`
-- `metrics.Registry` — counters use `sync/atomic`; histogram protected by mutex
+| Component | Mechanism |
+|---|---|
+| `WebViewPanel` tab state | Single goroutine (UI thread via `mainWindow.Synchronize`) |
+| `bridge.Bridge` profile | Atomic pointer swap (`UpdateProfile`) |
+| `jsonrpc.Server` handlers | Stateless; called concurrently |
+| `BookmarkStore` | `sync.RWMutex` |
+| `BrowsingHistoryStore` | `sync.Mutex` |
+| `DownloadManager` | `sync.Mutex` |
+| `audit.Logger` | `sync.Mutex` |

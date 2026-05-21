@@ -1,110 +1,150 @@
 # Windows Runtime
 
-Ghost-Silicon is designed for Windows 11. This document describes the
-Windows-specific isolation mechanisms it uses.
+Ghost-Silicon is a Windows 11 browser. This document covers Windows-specific
+runtime requirements, isolation primitives, and Win32 integration.
 
 ## Requirements
 
-| Requirement        | Minimum                        |
-|--------------------|--------------------------------|
-| OS                 | Windows 11 (build 22000+)      |
-| Architecture       | amd64                          |
-| Go                 | 1.22+                          |
-| Privileges         | Standard user (no admin needed for basic operation) |
+| Requirement | Minimum |
+|---|---|
+| OS | Windows 11 (build 22000+) |
+| Architecture | amd64 |
+| Go | 1.22+ |
+| WebView2 Runtime | Microsoft Edge WebView2 (ships with Windows 11) |
+| Privileges | Standard user (no admin needed for basic operation) |
 
-## Job Objects
+## Frameless Window
 
-Every renderer process is placed inside a Windows Job Object on startup.
+The browser chrome (tab strip, address bar) is an HTML overlay. The OS title
+bar is removed so it does not overlap.
 
-Key settings applied:
-- `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — all child processes are terminated
-  when the supervisor exits, preventing orphaned renderer processes.
-- Optional memory limit via `JOB_OBJECT_LIMIT_JOB_MEMORY`.
-- Optional CPU rate cap via `JobObjectCpuRateControlInformation`.
+In `pkg/browser/webview.go` (`NewWebViewPanel`):
 
-The Job Object is created with `CreateJobObject` and the renderer is assigned
-immediately after `CreateProcess` (while the process is suspended via
-`CREATE_SUSPENDED`) so the renderer cannot escape the job before execution begins.
+```go
+// Remove OS caption bar
+curStyle := win.GetWindowLong(hwnd, win.GWL_STYLE)
+win.SetWindowLong(hwnd, win.GWL_STYLE, curStyle &^ win.WS_CAPTION | win.WS_CLIPCHILDREN)
+win.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FRAMECHANGED|...)
 
-## Restricted Process Tokens
+// Restore DWM drop-shadow and Windows 11 rounded corners
+dwmapi.DwmExtendFrameIntoClientArea(hwnd, &margins{0,0,1,0})
+dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
+```
 
-When `sandbox.enable_restricted_token: true` (the default), the renderer is
-launched via `CreateProcessAsUser` with a token that has been:
+A custom WndProc (`subclassFrameless`) handles:
+- `WM_NCCALCSIZE` — removes the non-client area so WebView2 fills the entire frame
+- `WM_NCHITTEST` — returns `HTCLIENT` everywhere (drag and resize handled in JS)
 
-1. Duplicated from the current process with `DuplicateTokenEx`
-2. Had dangerous privileges removed via `AdjustTokenPrivileges` with
-   `SE_PRIVILEGE_REMOVED`
-3. Had its mandatory integrity level lowered to Medium (or Low if configured)
-   via `SetTokenInformation` with `TokenIntegrityLevel`
+## Job Objects (external renderer mode)
+
+When `engine.executable` is set, the renderer process is placed in a Job
+Object at creation time.
+
+Key settings:
+- `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — all child processes terminated when
+  the supervisor exits; no orphaned renderers
+- `JOB_OBJECT_LIMIT_JOB_MEMORY` — optional memory cap (bytes)
+- `JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | HARD_CAP` — optional CPU rate cap
+
+The renderer is launched with `CREATE_SUSPENDED`, assigned to the Job Object,
+then resumed via `ResumeThread`. This prevents escaping the job between
+creation and assignment.
+
+## Restricted Process Tokens (external renderer mode)
+
+When `sandbox.enable_restricted_token: true`:
+
+1. `DuplicateTokenEx` — copy current process token
+2. `AdjustTokenPrivileges` with `SE_PRIVILEGE_REMOVED` — strips dangerous privileges
+3. `SetTokenInformation(TokenIntegrityLevel)` — sets Medium (or Low) integrity
 
 Privileges removed by default:
-- `SeDebugPrivilege`
-- `SeLoadDriverPrivilege`
-- `SeTcbPrivilege`
-- `SeBackupPrivilege` / `SeRestorePrivilege`
-- `SeCreateTokenPrivilege`
-- `SeTakeOwnershipPrivilege`
-- `SeAssignPrimaryTokenPrivilege`
-- `SeImpersonatePrivilege`
-- `SeCreateGlobalPrivilege`
+
+| Privilege | Why |
+|---|---|
+| `SeDebugPrivilege` | Cannot attach debugger to other processes |
+| `SeLoadDriverPrivilege` | Cannot load kernel drivers |
+| `SeTcbPrivilege` | Cannot act as OS |
+| `SeBackupPrivilege` | Cannot bypass file ACLs for reads |
+| `SeRestorePrivilege` | Cannot bypass file ACLs for writes |
+| `SeCreateTokenPrivilege` | Cannot forge tokens |
+| `SeTakeOwnershipPrivilege` | Cannot seize object ownership |
+| `SeAssignPrimaryTokenPrivilege` | Cannot swap process tokens |
+| `SeImpersonatePrivilege` | Cannot impersonate other users |
+| `SeCreateGlobalPrivilege` | Cannot create global kernel objects |
 
 ## Per-Session Filesystem
 
-Each session gets its own isolated directory tree:
+Created by `filesystem.CreateSessionLayout` for every run:
 
 ```
 %APPDATA%\ghost-silicon\sessions\<session-id>\
-  cache\          HTTP cache (--disk-cache-dir)
-  cookies\        Cookie storage
-  local_data\     localStorage / IndexedDB
-  downloads\      Default download location
-  extensions\     Extension data
-  logs\           Renderer log files
-  session.json    Session metadata
+├── cache\            HTTP cache (--disk-cache-dir for external renderers)
+├── cookies\          Cookie storage
+├── local_data\       localStorage / IndexedDB
+├── downloads\        Default download location
+├── extensions\       Extension data
+├── logs\
+│   └── renderer.log
+└── session.json      Session metadata
 ```
 
-The session root is passed to the renderer via `--user-data-dir`. This means
-cookies, localStorage, and cached data are completely isolated between sessions.
+In embedded WebView2 mode, `<session-id>\` is passed as `DataPath` to
+go-webview2, providing automatic per-session isolation for cookies,
+localStorage, and cache.
 
-## Windows Firewall
-
-Optional per-session firewall rules can be applied via `netsh advfirewall`.
-These rules tag outbound traffic for the session and block unexpected inbound
-connections.
-
-Configure in `configs/sandbox-policy.yaml`.
+ACL applied by `filesystem.LockToCurrentUser`:
+```
+SDDL: O:<SID>G:<SID>D:(A;OICI;FA;;;<SID>)
+```
+Only the owning user has Full Control.
 
 ## Named Pipe Security
 
-The bridge named pipe is secured with a DACL that grants access only to the
-current Windows user (owner). Other users on the same machine cannot connect
-to the bridge pipe.
+The bridge pipe is created with a DACL granting `GENERIC_ALL` only to the
+current user's SID:
 
-The pipe name format: `\\.\pipe\ghost-silicon-bridge`
+```
+SDDL: D:(A;;GA;;;<current-user-SID>)
+```
 
-Customise in `configs/ghost-silicon.yaml` under `ipc.pipe_name`.
+Pipe name: `\\.\pipe\ghost-silicon-bridge` (configurable via `ipc.pipe_name`).
 
-## AppContainer (Experimental)
+## Windows Firewall (optional)
 
-AppContainer-style isolation is stubbed in Phase 1. Enable it with:
+Per-session firewall rules via `netsh advfirewall`:
+
+1. **Outbound allow** — permits all outbound traffic from the session
+2. **Inbound block** — blocks all non-loopback inbound connections
+
+Rules are tagged with the session ID and removed on session stop.
+
+## Registry Access
+
+Ghost-Silicon reads two registry paths at startup:
+
+- `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` —
+  system proxy configuration (fallback when `network.proxy_url` is empty)
+- `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces` —
+  system DNS servers (fallback when `network.dns_servers` is empty)
+
+No registry values are written.
+
+## DWM APIs Used
+
+| API | Purpose |
+|---|---|
+| `DwmExtendFrameIntoClientArea` | 1-pixel top margin restores shadow |
+| `DwmSetWindowAttribute(DWMWA_NCRENDERING_POLICY)` | Disable non-client rendering |
+| `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE)` | Windows 11 rounded corners |
+
+## AppContainer (Planned)
+
+AppContainer-style isolation is planned. Enable with:
 
 ```yaml
 sandbox:
   enable_app_container: true
 ```
 
-Full `CreateAppContainerProfile` integration is planned for Phase 2.
-
-## Registry Access
-
-The supervisor reads two registry paths at startup:
-
-- `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` —
-  reads the system proxy configuration so it can default to the user's
-  configured proxy when no `network.proxy_url` is set.
-
-- `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces` —
-  reads system DNS server addresses as a fallback when no `network.dns_servers`
-  list is configured.
-
-No registry values are written by ghost-silicon.
+Full `CreateAppContainerProfile` + capability SID integration is in the backlog.

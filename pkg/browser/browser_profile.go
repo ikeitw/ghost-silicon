@@ -1,10 +1,9 @@
-// pkg/browser/browser_profile.go
 //go:build windows
 
 // Package browser — named browser profile store.
-// A BrowserProfile is a named account that persists the user's browsing state
-// (tabs, history, bookmarks, WebView2 session data) across restarts.
-// It is separate from the identity.Profile, which controls fingerprint spoofing.
+// A BrowserProfile is a named account that persists browsing state (tabs,
+// history, bookmarks, WebView2 session data) across restarts.
+// It is distinct from identity.Profile, which controls fingerprint spoofing.
 package browser
 
 import (
@@ -20,7 +19,7 @@ import (
 	"ghost-silicon/pkg/identity"
 )
 
-// BrowserProfile is the metadata record stored in <profile-dir>/profile.json.
+// BrowserProfile is the metadata stored at <profile-dir>/profile.json.
 type BrowserProfile struct {
 	ID              string    `json:"id"`
 	Name            string    `json:"name"`
@@ -45,7 +44,7 @@ func NewBrowserProfileStore(baseDir string) (*BrowserProfileStore, error) {
 	return &BrowserProfileStore{baseDir: baseDir}, nil
 }
 
-// List returns all profiles sorted by most recently used first.
+// List returns all profiles, most recently used first.
 func (s *BrowserProfileStore) List() ([]*BrowserProfile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,7 +69,6 @@ func (s *BrowserProfileStore) List() ([]*BrowserProfile, error) {
 	return profiles, nil
 }
 
-// Create makes a new profile with the given name and returns it.
 func (s *BrowserProfileStore) Create(name, searchEngineURL string) (*BrowserProfile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,7 +87,6 @@ func (s *BrowserProfileStore) Create(name, searchEngineURL string) (*BrowserProf
 	return p, writeJSON(filepath.Join(dir, "profile.json"), p)
 }
 
-// Load returns the profile metadata for id.
 func (s *BrowserProfileStore) Load(id string) (*BrowserProfile, error) {
 	var p BrowserProfile
 	if err := readJSON(filepath.Join(s.baseDir, id, "profile.json"), &p); err != nil {
@@ -122,7 +119,6 @@ func (s *BrowserProfileStore) Delete(id string) error {
 	return os.RemoveAll(filepath.Join(s.baseDir, id))
 }
 
-// Rename updates the display name of a profile.
 func (s *BrowserProfileStore) Rename(id, newName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

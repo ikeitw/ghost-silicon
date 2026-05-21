@@ -1,4 +1,3 @@
-// pkg/browser/webview.go
 //go:build windows
 
 // Package browser — WebView2 embed and browser chrome.
@@ -38,8 +37,6 @@ import (
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
 )
-
-// ── Blocker wiring helpers ────────────────────────────────────────────────────
 
 // wvBrowserSlot mirrors the first 4 words of go-webview2's unexported webview
 // struct (commit dc24628cff85) so we can access the browser interface field.
@@ -262,19 +259,18 @@ func NewWebViewPanel(
 		return wp.ShowCmd == swMaximize
 	})
 
-	// ── Debug helper (temporary) ──────────────────────────────────────────
+	// ── Debug helper ──────────────────────────────────────────────────────
 	p.wv.Bind("__ghostDebug", func(msg string) {
 		p.log.Info("JS-DEBUG: " + msg)
 	})
 
 	// ── Tab state ─────────────────────────────────────────────────────────
-	// Load saved tab state from the profile directory (session restore).
 	p.loadTabsJSON()
 
-	// __ghostGetTabs is void: value-returning bindings don't resolve when using
-	// Walk's mw.Run() instead of wv.Run(). Go pushes data to JS by calling
-	// window.__ghostTabsCb (set by JS before invoking __ghostGetTabs) via
-	// mainWindow.Synchronize + Eval, which is confirmed to work.
+	// __ghostGetTabs can't return a value: go-webview2 bindings don't resolve
+	// promises when Walk's mw.Run() drives the loop instead of wv.Run().
+	// Workaround: JS sets window.__ghostTabsCb before calling __ghostGetTabs;
+	// Go calls the callback via Synchronize+Eval, which runs on the UI thread.
 	p.wv.Bind("__ghostGetTabs", func() {
 		data := p.tabsJSON
 		p.mainWindow.Synchronize(func() {
@@ -441,14 +437,13 @@ func NewWebViewPanel(
 
 	// ── Navigate binding ──────────────────────────────────────────────────
 	p.wv.Bind("__ghostNavigate", p.handleGhostScheme)
-	// __ghostGoTo navigates to ghost:// pages from the Go side via
-	// mainWindow.Synchronize+Navigate.  p.wv.Dispatch() is a no-op here
-	// because p.wv.Run() is never called (Walk's mw.Run() drives the loop).
-	// Synchronize posts onto Walk's loop, which runs on the same main thread
-	// that created the WebView2 controller.
-	// __ghostGoTo(url, tabsJSON) — tabsJSON is the current _T from JS, passed
-	// so we never race against a pending __ghostSetTabs goroutine updating
-	// p.tabsJSON.  JS always has the authoritative latest tab state.
+	// __ghostGoTo(url, tabsJSON): navigates to a ghost:// page via Go.
+	// tabsJSON comes from JS (_T) rather than p.tabsJSON to avoid a race with
+	// the goroutine spawned by __ghostSetTabs.  JS always holds the canonical
+	// tab state; p.tabsJSON is only a persistence buffer.
+	// p.wv.Dispatch() can't be used here because wv.Run() is never called —
+	// Walk's mw.Run() drives the loop, so Synchronize is the only safe way to
+	// post work onto the WebView2 thread.
 	p.wv.Bind("__ghostGoTo", func(url, tabsJSON string) {
 		if !strings.HasPrefix(url, "ghost://") {
 			return
@@ -826,7 +821,7 @@ function _updateCur(){
     }
   }
 }
-/* ── Navigation helper: ghost:// goes via Go NavigateToString, http via location ─ */
+/* ── Navigation: ghost:// pages must go through Go to get tab state injected ─ */
 function _ghostGoTo(url){
   if(url.startsWith('ghost://')){
     try{__ghostGoTo(url,JSON.stringify(_T));}catch(e){console.error('[ghost] __ghostGoTo threw:',e);}
@@ -1227,10 +1222,10 @@ document.addEventListener('keydown',function(e){
   }
 },true);
 
-/* ── New-window intercept: keep target=_blank inside our tabs ── */
-// WebView2 fires NewWindowRequested for window.open() and target=_blank;
-// without a native handler it spawns a raw OS window. We intercept both at
-// the JS layer so all new-window requests stay inside the tab strip.
+/* ── New-window intercept ────────────────────────────────────── */
+// WebView2 spawns a raw OS window for window.open() and target=_blank when
+// NewWindowRequested has no handler. We override both at the JS layer so
+// those navigations stay in the current tab instead.
 (function(){
   var _wo=window.open;
   window.open=function(url,name,feat){

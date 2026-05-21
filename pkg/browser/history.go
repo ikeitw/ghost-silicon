@@ -1,6 +1,3 @@
-// pkg/browser/history.go
-// NavigationHistory tracks back/forward navigation for one browser tab.
-// BrowsingHistoryStore persists the global visited-pages history to disk.
 package browser
 
 import (
@@ -27,7 +24,6 @@ type NavigationHistory struct {
 	forward []HistoryEntry
 }
 
-// NewNavigationHistory returns an empty history.
 func NewNavigationHistory() *NavigationHistory {
 	return &NavigationHistory{}
 }
@@ -77,21 +73,18 @@ func (h *NavigationHistory) Forward() (HistoryEntry, bool) {
 	return h.current, true
 }
 
-// CanGoBack reports whether the back stack is non-empty.
 func (h *NavigationHistory) CanGoBack() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.back) > 0
 }
 
-// CanGoForward reports whether the forward stack is non-empty.
 func (h *NavigationHistory) CanGoForward() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.forward) > 0
 }
 
-// Current returns the entry for the currently loaded page.
 func (h *NavigationHistory) Current() HistoryEntry {
 	h.mu.Lock()
 	defer h.mu.Unlock()

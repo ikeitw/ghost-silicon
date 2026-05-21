@@ -1,4 +1,3 @@
-// pkg/browser/setup.go
 //go:build windows
 
 // Package browser — first-launch identity setup wizard.
@@ -27,8 +26,6 @@ type SetupResult struct {
 	BrowserProfileID  string
 	BrowserProfileDir string
 }
-
-// ── preset tables ─────────────────────────────────────────────────────────────
 
 type setupOSPreset struct {
 	Label    string
@@ -298,6 +295,12 @@ func (sw *setupWin) run(userDataDir string) (*SetupResult, error) {
 	return sw.buildResult(sw.choice)
 }
 
+// subclassWndProc replaces the window proc to strip the non-client area:
+//   - WM_NCCALCSIZE → return 0 (no NC border — entire rect is client area)
+//   - WM_NCHITTEST → return HTCLIENT (lets WebView2 receive all pointer events)
+//
+// This gives us a truly frameless window while the DWM attributes added above
+// preserve shadow and rounded corners.
 func (sw *setupWin) subclassWndProc() {
 	const (
 		gwlpWndProc  = ^uintptr(3)

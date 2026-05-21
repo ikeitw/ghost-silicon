@@ -1,4 +1,3 @@
-// pkg/browser/theme.go
 // Theme defines the Ghost-Silicon browser visual language.
 // Every colour, font, and spacing constant lives here — swap this file to
 // switch colour schemes without touching any widget code.

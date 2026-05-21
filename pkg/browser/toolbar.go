@@ -1,10 +1,9 @@
-// pkg/browser/toolbar.go
 //go:build windows
 
-// Package browser — browser toolbar.
-// Toolbar is a Walk Composite containing the navigation buttons, the address
-// bar, and the profile indicator badge.  It communicates with the rest of the
-// browser via narrow callback hooks so it can be tested without a live WebView.
+// Package browser — browser toolbar (Walk fallback).
+// Toolbar is a Walk Composite with nav buttons, address bar, and profile badge.
+// It is superseded by the HTML chrome overlay in webview.go; kept here because
+// it communicates via callbacks and can be tested without a live WebView.
 package browser
 
 import (
@@ -56,19 +55,16 @@ func NewToolbar(parent walk.Container) (*Toolbar, error) {
 	}
 	tb.composite = comp
 
-	// Fixed height.
 	comp.SetMinMaxSize(
 		walk.Size{Width: 0, Height: ToolbarHeight},
 		walk.Size{Width: 0, Height: ToolbarHeight},
 	)
 
-	// Dark background.
 	bgBrush, err := walk.NewSolidColorBrush(ColorSurface)
 	if err == nil {
 		comp.SetBackground(bgBrush)
 	}
 
-	// Horizontal layout with fixed margins.
 	layout := walk.NewHBoxLayout()
 	layout.SetMargins(walk.Margins{
 		HNear: PaddingM,
@@ -117,10 +113,8 @@ func NewToolbar(parent walk.Container) (*Toolbar, error) {
 	if f := FontAddress(); f != nil {
 		tb.addrBar.SetFont(f)
 	}
-	// Stretch to fill available space.
 	_ = layout.SetStretchFactor(tb.addrBar, 1)
 
-	// Pressing Enter navigates.
 	tb.addrBar.KeyPress().Attach(func(key walk.Key) {
 		if key == walk.KeyReturn {
 			tb.commitAddress()
@@ -152,7 +146,6 @@ func NewToolbar(parent walk.Container) (*Toolbar, error) {
 		return nil, err
 	}
 
-	// ── Wire button events ────────────────────────────────────────────────
 	tb.backBtn.Clicked().Attach(func() {
 		if tb.OnBack != nil {
 			tb.OnBack()
@@ -216,12 +209,10 @@ func (tb *Toolbar) SetNavState(canBack, canForward bool) {
 	tb.fwdBtn.SetEnabled(canForward)
 }
 
-// SetProfileName updates the profile badge tooltip and label.
 func (tb *Toolbar) SetProfileName(name string) {
 	tb.profileLabel.SetToolTipText("Profile: " + name)
 }
 
-// SetBookmarked updates the bookmark star button to filled (★) or empty (☆).
 func (tb *Toolbar) SetBookmarked(is bool) {
 	if is {
 		tb.bookmarkBtn.SetText("★")

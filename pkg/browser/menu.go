@@ -1,9 +1,7 @@
-// pkg/browser/menu.go
 //go:build windows
 
 // Package browser — application menu and keyboard shortcuts.
-// All Walk Actions are created here and registered on the MainWindow.
-// The Browser wires each action's Triggered() event to the appropriate method.
+// All Walk Actions are created here. Callers bind Triggered() after the fact.
 package browser
 
 import (

@@ -1,10 +1,10 @@
-// pkg/browser/window.go
 //go:build windows
 
 // Package browser — main browser window.
 // Window is the root Walk MainWindow. It owns the WebView panel, bookmarks,
 // download manager, devtools, and menu actions. The browser chrome (address
-// bar, tabs, nav buttons) is rendered as an HTML overlay inside WebView2.
+// bar, tabs, nav buttons) is rendered as an HTML overlay inside WebView2 rather
+// than as Win32 child windows, which avoids all Z-order and WndProc conflicts.
 package browser
 
 import (
@@ -91,18 +91,16 @@ func (w *Window) Open() error {
 	mw.SetTitle(w.windowTitle(""))
 
 	// ── Frameless chrome ──────────────────────────────────────────────────
-	// Remove the OS title bar so the HTML overlay tab strip acts as the
-	// window frame (Chrome-style). We keep WS_THICKFRAME so the window
-	// remains resizable from all edges, and call DwmExtendFrameIntoClientArea
-	// with a 1-pixel top margin to restore the DWM drop-shadow and Windows 11
-	// rounded corners that are otherwise lost when WS_CAPTION is removed.
+	// Strip WS_CAPTION so the HTML tab strip acts as the title bar.
+	// WS_THICKFRAME is kept so all-edge resize still works.
+	// DwmExtendFrameIntoClientArea with a 1-px top margin restores the DWM
+	// drop-shadow and Windows 11 rounded corners lost when CAPTION is removed.
 	mwHWND := win.HWND(uintptr(mw.Handle()))
 	curStyle := win.GetWindowLong(mwHWND, win.GWL_STYLE)
 	win.SetWindowLong(mwHWND, win.GWL_STYLE, curStyle&^win.WS_CAPTION)
 	win.SetWindowPos(mwHWND, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
 
-	// Restore shadow + rounded corners via DWM.
 	type dwmMargins struct{ L, R, T, B int32 }
 	m := dwmMargins{0, 0, 1, 0}
 	syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmExtendFrameIntoClientArea").Call(
@@ -110,21 +108,18 @@ func (w *Window) Open() error {
 
 	mw.SetSize(walk.Size{Width: defaultWindowW, Height: defaultWindowH})
 
-	// Dark background — prevents a white flash when the window resizes before
-	// WebView2 catches up. Colour matches the ghost:// page background.
+	// Prevents a white flash when the window resizes before WebView2 repaints.
 	if bgBrush, err := walk.NewSolidColorBrush(walk.RGB(10, 10, 30)); err == nil {
 		mw.SetBackground(bgBrush)
 	}
 
-	// WS_CLIPCHILDREN: prevent Walk's background fill from painting over the
-	// WebView2 area during resize/maximize transitions.
+	// Prevents Walk's background fill from overpainting WebView2 during resize.
 	curStyle2 := win.GetWindowLong(mwHWND, win.GWL_STYLE)
 	win.SetWindowLong(mwHWND, win.GWL_STYLE, curStyle2|win.WS_CLIPCHILDREN)
 
-	// Walk requires a non-nil layout on the main window so its internal
-	// startLayout call (triggered on every WM_SIZE) does not panic.
-	// The VBoxLayout has no Walk-managed children — WebView2 is a raw HWND
-	// invisible to Walk's widget tree — so it is a safe no-op.
+	// Walk panics on WM_SIZE if the main window has no layout, but our only
+	// child is a raw WebView2 HWND that Walk cannot see — so an empty VBox
+	// satisfies Walk while doing nothing to the actual layout.
 	emptyLayout := walk.NewVBoxLayout()
 	emptyLayout.SetMargins(walk.Margins{})
 	emptyLayout.SetSpacing(0)
@@ -152,18 +147,13 @@ func (w *Window) Open() error {
 	}
 
 	// ── WebView panel (fills entire client area) ──────────────────────────
-	// The browser chrome (toolbar, tabs, address bar) is rendered as a
-	// position:fixed HTML overlay injected into every page by WebViewPanel.
-	// This eliminates all Win32 child-window Z-order / WndProc conflicts.
 	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.opts.SearchEngineURL, w.log,
 		w.bookmarks, w.browsingHist, w.dlMgr)
 	if err != nil {
 		return fmt.Errorf("webview panel: %w", err)
 	}
 
-	// go-webview2 creates its own top-level window; Walk's MainWindow is an
-	// unused background window.  Hide it so only the WebView2 window is
-	// visible to the user.
+	// go-webview2 creates its own top-level HWND; Walk's MainWindow stays hidden.
 	win.ShowWindow(mwHWND, win.SW_HIDE)
 
 	// ── DevTools ──────────────────────────────────────────────────────────
@@ -210,8 +200,6 @@ func (w *Window) UpdateProfile() {
 		w.webview.UpdateProfile()
 	})
 }
-
-// ── Tab wiring ────────────────────────────────────────────────────────────────
 
 // ── Action wiring ─────────────────────────────────────────────────────────────
 

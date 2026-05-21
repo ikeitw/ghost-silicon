@@ -1,10 +1,8 @@
-// pkg/browser/devtools.go
 //go:build windows
 
-// Package browser — developer tools panel.
-// DevToolsPanel wraps the WebView2-native DevTools window, which is opened by
-// calling OpenDevToolsWindow on the CoreWebView2 COM object.  The panel struct
-// acts as a toggle handle — the window itself is owned by the WebView2 runtime.
+// Package browser — developer tools toggle.
+// DevToolsPanel is a thin handle around the WebView2-native DevTools window.
+// The window itself is owned and managed by the WebView2 runtime.
 package browser
 
 import (
@@ -15,15 +13,14 @@ import (
 )
 
 // DevToolsPanel manages the DevTools window for a single WebView2 view.
-// It does not create any Walk widgets of its own; DevTools is a separate
-// top-level window managed by the WebView2 runtime.
+// No Walk widgets are created — DevTools is a separate OS window owned by
+// the WebView2 runtime.
 type DevToolsPanel struct {
 	wv     webview2.WebView
 	open   bool
 	hotkey *walk.Action // bound in menu.go; toggled here
 }
 
-// NewDevToolsPanel creates a DevToolsPanel backed by wv.
 func NewDevToolsPanel(wv webview2.WebView) *DevToolsPanel {
 	return &DevToolsPanel{wv: wv}
 }
@@ -36,23 +33,19 @@ func (d *DevToolsPanel) Toggle() {
 		return
 	}
 	d.wv.Dispatch(func() {
-		// OpenDevToolsWindow is idempotent — calling it twice simply
-		// focuses the already-open window.
 		d.wv.Eval(`window.open = window.open`) // no-op eval to check liveness
 		openDevTools(d.wv)
 		d.open = true
 	})
 }
 
-// IsOpen reports whether the DevTools window has been opened in this session.
-// Note: this is advisory — the user may close the DevTools window via its own
-// title-bar close button, so the flag may be stale.
+// IsOpen is advisory: the user can close DevTools via its own close button,
+// so the flag may be stale.
 func (d *DevToolsPanel) IsOpen() bool {
 	return d.open
 }
 
-// InjectConsoleShortcut binds F12 on the main window to Toggle().
-// action should be the Action created in menu.go.
+// InjectConsoleShortcut binds F12 to Toggle() via the menu.go action.
 func (d *DevToolsPanel) InjectConsoleShortcut(action *walk.Action) {
 	if action == nil {
 		return
@@ -81,17 +74,10 @@ func (d *DevToolsPanel) InspectElement(x, y int) {
 	})
 }
 
-// openDevTools calls the WebView2 OpenDevToolsWindow via a JavaScript trick:
-// WebView2's webview C wrapper exposes devtools through the underlying COM
-// controller.  We call Eval with the DevTools hotkey sequence as a fallback
-// because the go-webview2 wrapper does not yet expose OpenDevToolsWindow
-// directly through its public API.
-//
-// Production note: replace this with a direct COM call to
-// ICoreWebView2.OpenDevToolsWindow() once go-webview2 exposes it, or use the
-// pkg/webview2/v2 sub-package which provides lower-level COM access.
+// openDevTools triggers DevTools by dispatching a synthetic F12 keydown event.
+// go-webview2 doesn't expose ICoreWebView2.OpenDevToolsWindow(); the synthetic
+// key event is the workaround. Replace with a direct COM call if the wrapper
+// ever exposes OpenDevToolsWindow.
 func openDevTools(wv webview2.WebView) {
-	// Simulate F12 press inside the WebView2 content area.
-	// WebView2 intercepts this and opens its built-in DevTools.
 	wv.Eval(`(function(){var e=new KeyboardEvent('keydown',{key:'F12',keyCode:123,which:123,bubbles:true});document.dispatchEvent(e)})()`)
 }

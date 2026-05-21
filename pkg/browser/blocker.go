@@ -1,4 +1,3 @@
-// pkg/browser/blocker.go
 // Blocker provides fast hostname-based tracker/ad blocking backed by an
 // embedded blocklist. It is safe for concurrent use.
 package browser
@@ -19,7 +18,6 @@ type Blocker struct {
 	blocked int64 // accessed atomically
 }
 
-// NewBlocker parses the embedded blocklist.txt and returns a ready Blocker.
 func NewBlocker() *Blocker {
 	b := &Blocker{hosts: make(map[string]struct{})}
 	for _, line := range strings.Split(blocklistData, "\n") {

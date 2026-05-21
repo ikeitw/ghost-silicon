@@ -1,10 +1,9 @@
-// pkg/browser/tabs.go
 //go:build windows
 
-// Package browser — tab strip.
-// TabStrip is a Walk CustomWidget that draws its own tabs using GDI.
-// It manages a list of Tab values and calls back into the Browser to
-// switch the active page when the user clicks a tab or the close button.
+// Package browser — tab strip (Walk fallback).
+// TabStrip is a Walk CustomWidget that draws tabs using Walk's Canvas API.
+// It is superseded by the HTML chrome overlay in webview.go; kept here as a
+// fallback in case the HTML approach is ever dropped.
 package browser
 
 import (
@@ -24,8 +23,7 @@ type Tab struct {
 	History *NavigationHistory
 }
 
-// displayTitle returns the title shown on the tab chip.
-// Falls back to a shortened URL if the page title is blank.
+// displayTitle falls back to a shortened URL if the page title is blank.
 func (t *Tab) displayTitle() string {
 	if t.Title != "" {
 		return t.Title
@@ -57,7 +55,6 @@ type TabStrip struct {
 	OnNew    func()
 }
 
-// NewTabStrip creates the tab strip as a child of parent and returns it.
 func NewTabStrip(parent walk.Container) (*TabStrip, error) {
 	ts := &TabStrip{active: -1}
 
@@ -72,7 +69,6 @@ func NewTabStrip(parent walk.Container) (*TabStrip, error) {
 	cw.MouseDown().Attach(ts.onMouseDown)
 	ts.widget = cw
 
-	// Start with one blank tab.
 	ts.addTabLocked("", "New Tab")
 	return ts, nil
 }
@@ -115,7 +111,6 @@ func (ts *TabStrip) CloseTab(id string) {
 	}
 }
 
-// SelectTab marks the tab with id as active.
 func (ts *TabStrip) SelectTab(id string) {
 	ts.mu.Lock()
 	idx := ts.indexByID(id)
@@ -127,6 +122,7 @@ func (ts *TabStrip) SelectTab(id string) {
 }
 
 // ActiveTab returns the currently active Tab, or nil if the strip is empty.
+// Returns a copy — safe to read without holding the lock.
 func (ts *TabStrip) ActiveTab() *Tab {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
@@ -137,7 +133,6 @@ func (ts *TabStrip) ActiveTab() *Tab {
 	return &cp
 }
 
-// UpdateTab refreshes the URL, title, and loading state of an existing tab.
 func (ts *TabStrip) UpdateTab(id, url, title string, loading bool) {
 	ts.mu.Lock()
 	if idx := ts.indexByID(id); idx >= 0 {
@@ -163,8 +158,7 @@ func (ts *TabStrip) Tabs() []*Tab {
 
 // ── painting ──────────────────────────────────────────────────────────────────
 
-// dtFlags packages the DrawTextFormat flags used for tab labels.
-// Walk's DrawTextFormat is a uint that wraps win32 DT_ constants directly.
+// DrawText format flags for tab labels (Walk wraps DT_ win32 constants as uint).
 const (
 	dtTabTitle  = walk.DrawTextFormat(win.DT_SINGLELINE | win.DT_VCENTER | win.DT_END_ELLIPSIS)
 	dtTabCenter = walk.DrawTextFormat(win.DT_SINGLELINE | win.DT_VCENTER | win.DT_CENTER)
@@ -177,7 +171,6 @@ func (ts *TabStrip) paint(canvas *walk.Canvas, updateBounds walk.Rectangle) erro
 	active := ts.active
 	ts.mu.RUnlock()
 
-	// Background fill.
 	bgBrush, err := walk.NewSolidColorBrush(ColorSurface)
 	if err != nil {
 		return err
@@ -300,7 +293,6 @@ func (ts *TabStrip) onMouseDown(x, y int, button walk.MouseButton) {
 		tabW = TabMinWidth
 	}
 
-	// Check "+" button.
 	plusX := len(tabs) * tabW
 	if x >= plusX && x <= plusX+32 {
 		if ts.OnNew != nil {
@@ -309,14 +301,12 @@ func (ts *TabStrip) onMouseDown(x, y int, button walk.MouseButton) {
 		return
 	}
 
-	// Check individual tabs.
 	for i, t := range tabs {
 		tabLeft := i * tabW
 		tabRight := tabLeft + tabW - 2
 		if x < tabLeft || x > tabRight {
 			continue
 		}
-		// Check if click hit the × button.
 		closeLeft := tabRight - TabCloseSize - 4
 		if x >= closeLeft && (len(tabs) > 1 || i == ts.active) {
 			if ts.OnClose != nil {
@@ -324,7 +314,6 @@ func (ts *TabStrip) onMouseDown(x, y int, button walk.MouseButton) {
 			}
 			return
 		}
-		// Otherwise: select the tab.
 		ts.mu.Lock()
 		ts.active = i
 		ts.mu.Unlock()

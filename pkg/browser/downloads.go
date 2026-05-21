@@ -1,9 +1,9 @@
-// pkg/browser/downloads.go
 //go:build windows
 
 // Package browser — download manager.
-// Tracks in-progress and completed downloads and provides a Walk panel widget
-// that the window can show/hide from the hamburger menu.
+// Tracks in-progress and completed downloads.  The primary UI is the HTML
+// download shelf injected by WebViewPanel; DownloadPanel (below) is a legacy
+// Walk fallback that is no longer wired to the main window.
 package browser
 
 import (
@@ -25,7 +25,6 @@ const (
 	DownloadCancelled
 )
 
-// DownloadItem tracks one in-flight or completed download.
 type DownloadItem struct {
 	ID          string
 	URL         string
@@ -47,7 +46,6 @@ func (d *DownloadItem) Progress() float64 {
 	return float64(d.RecvBytes) / float64(d.TotalBytes)
 }
 
-// ProgressLabel returns a human-readable size/progress string.
 func (d *DownloadItem) ProgressLabel() string {
 	switch d.State {
 	case DownloadComplete:
@@ -75,12 +73,10 @@ type DownloadManager struct {
 	items []*DownloadItem
 	seqID int
 
-	// onChange is called on the UI thread whenever the list changes.
-	// Set by the panel after creation.
+	// onChange is set by WebViewPanel to push updated JSON to the HTML shelf.
 	onChange func()
 }
 
-// NewDownloadManager creates an empty manager.
 func NewDownloadManager() *DownloadManager {
 	return &DownloadManager{}
 }
@@ -182,17 +178,15 @@ func (m *DownloadManager) notify() {
 	}
 }
 
-// ── Walk UI panel ─────────────────────────────────────────────────────────────
+// ── Walk UI panel (legacy — superseded by the HTML download shelf) ────────────
 
 // DownloadPanel is a Walk Composite that lists current downloads.
-// It is hidden by default and toggled from the browser menu.
 type DownloadPanel struct {
 	*walk.Composite
 	manager *DownloadManager
 	list    *walk.ListBox
 }
 
-// NewDownloadPanel creates the panel as a child of parent and wires it to mgr.
 func NewDownloadPanel(parent walk.Container, mgr *DownloadManager) (*DownloadPanel, error) {
 	comp, err := walk.NewComposite(parent)
 	if err != nil {
@@ -209,7 +203,6 @@ func NewDownloadPanel(parent walk.Container, mgr *DownloadManager) (*DownloadPan
 		comp.SetBackground(bg)
 	}
 
-	// Header label.
 	lbl, err := walk.NewLabel(comp)
 	if err != nil {
 		return nil, fmt.Errorf("download panel label: %w", err)
@@ -219,7 +212,6 @@ func NewDownloadPanel(parent walk.Container, mgr *DownloadManager) (*DownloadPan
 		lbl.SetFont(f)
 	}
 
-	// List box showing download items as text lines.
 	lb, err := walk.NewListBox(comp)
 	if err != nil {
 		return nil, fmt.Errorf("download panel listbox: %w", err)
@@ -228,7 +220,6 @@ func NewDownloadPanel(parent walk.Container, mgr *DownloadManager) (*DownloadPan
 
 	dp := &DownloadPanel{Composite: comp, manager: mgr, list: lb}
 
-	// Hook manager notifications to refresh the list.
 	mgr.onChange = func() {
 		comp.Synchronize(dp.refresh)
 	}

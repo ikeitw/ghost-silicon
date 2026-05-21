@@ -206,10 +206,10 @@ func NewWebViewPanel(
 
 	// ── Tab state ─────────────────────────────────────────────────────────
 	p.tabsJSON = `{"tabs":[{"id":1,"url":"ghost://newtab","title":"New Tab"}],"current":1}`
-	// __ghostGetTabs is void: Go pushes the data to JS via mainWindow.Synchronize
-	// + Eval because value-returning bindings never resolve — go-webview2 sends
-	// results via its own Dispatch queue which requires wv.Run(), but this app
-	// runs Walk's mw.Run() instead.
+	// __ghostGetTabs is void: value-returning bindings don't resolve when using
+	// Walk's mw.Run() instead of wv.Run(). Go pushes data to JS by calling
+	// window.__ghostTabsCb (set by JS before invoking __ghostGetTabs) via
+	// mainWindow.Synchronize + Eval, which is confirmed to work.
 	p.wv.Bind("__ghostGetTabs", func() {
 		data := p.tabsJSON
 		p.mainWindow.Synchronize(func() {
@@ -370,17 +370,11 @@ func NewWebViewPanel(
 	// Synchronize posts onto Walk's loop, which runs on the same main thread
 	// that created the WebView2 controller.
 	p.wv.Bind("__ghostGoTo", func(url string) {
-		p.log.Info("__ghostGoTo binding called", "url", url)
 		if !strings.HasPrefix(url, "ghost://") {
-			p.log.Info("__ghostGoTo: not ghost://, ignoring")
 			return
 		}
-		html := p.ghostPageHTML(url)
-		encoded := base64.StdEncoding.EncodeToString([]byte(html))
-		dataURL := "data:text/html;base64," + encoded
-		p.log.Info("__ghostGoTo: scheduling Navigate via Synchronize", "url", url)
+		dataURL := "data:text/html;base64," + p.ghostPageDataURL(url)
 		p.mainWindow.Synchronize(func() {
-			p.log.Info("__ghostGoTo: Navigate executing", "url", url)
 			p.wv.Navigate(dataURL)
 		})
 	})
@@ -404,9 +398,7 @@ func (p *WebViewPanel) Navigate(url string) {
 	}
 	p.log.Info("navigate", "url", url)
 	if strings.HasPrefix(url, "ghost://") {
-		html := p.ghostPageHTML(url)
-		encoded := base64.StdEncoding.EncodeToString([]byte(html))
-		p.wv.Navigate("data:text/html;base64," + encoded)
+		p.wv.Navigate("data:text/html;base64," + p.ghostPageDataURL(url))
 		return
 	}
 	p.wv.Navigate(url)
@@ -561,15 +553,22 @@ var _badgeEl=bar.querySelector('#_gs_badge');
 var _T={tabs:[],current:0};var _loaded=false;var _loadQ=[];
 function _url(){return window.__ghostPageURL||location.href;}
 function _load(cb){
-  console.log('[ghost] _load _loaded='+_loaded+' qlen='+_loadQ.length);
   if(_loaded){if(cb)cb();return;}
   if(cb)_loadQ.push(cb);
   if(_loadQ.length>1)return;
-  try{__ghostGetTabs().then(function(j){
-    try{_T=JSON.parse(j);}catch(_){_T=null;}
-    if(!_T||!_T.tabs||!_T.tabs.length){_T={tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};}
+  // Fast path: Go pre-injected tab state into the ghost:// page HTML.
+  if(window.__ghostInitTabs&&window.__ghostInitTabs.tabs&&window.__ghostInitTabs.tabs.length){
+    _T=window.__ghostInitTabs;
+    _loaded=true;var q0=_loadQ.splice(0);q0.forEach(function(f){try{f();}catch(_){}});
+    return;
+  }
+  // Slow path: regular web page — ask Go via callback.
+  window.__ghostTabsCb=function(obj){
+    _T=(obj&&obj.tabs&&obj.tabs.length)?obj:{tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};
     _loaded=true;var q=_loadQ.splice(0);q.forEach(function(f){try{f();}catch(_){}});
-  });}catch(e){
+  };
+  try{__ghostGetTabs();}catch(e){
+    window.__ghostTabsCb=null;
     if(!_T||!_T.tabs||!_T.tabs.length){_T={tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};}
     _loaded=true;var q2=_loadQ.splice(0);q2.forEach(function(f){try{f();}catch(_){}});
   }
@@ -618,7 +617,12 @@ function _ghostGoTo(url){
 }
 function _switchTab(id){
   _updateCur();_T.current=id;_save();_render();
-  for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){_ghostGoTo(_T.tabs[i].url);return;}}
+  for(var i=0;i<_T.tabs.length;i++){
+    if(_T.tabs[i].id===id){
+      if(_T.tabs[i].url===_url())return;
+      _ghostGoTo(_T.tabs[i].url);return;
+    }
+  }
 }
 window._gsNewTab=function(){
   console.log('[ghost] _gsNewTab _loaded='+_loaded+' tabs='+((_T&&_T.tabs)?_T.tabs.length:0));
@@ -982,6 +986,16 @@ window.addEventListener('keydown',function(e){
   }
 });
 })();`)
+}
+
+// ghostPageDataURL builds a ghost:// page, injects the current tab state as
+// window.__ghostInitTabs so _load() can restore it synchronously without the
+// async __ghostGetTabs round-trip, then returns a base64 data URL.
+func (p *WebViewPanel) ghostPageDataURL(url string) string {
+	html := p.ghostPageHTML(url)
+	script := `<script>window.__ghostInitTabs=` + p.tabsJSON + `;</script>`
+	html = strings.Replace(html, "</head>", script+"</head>", 1)
+	return base64.StdEncoding.EncodeToString([]byte(html))
 }
 
 // ghostPageHTML returns fully self-contained HTML for ghost:// internal URLs.

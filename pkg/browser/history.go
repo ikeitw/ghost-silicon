@@ -1,9 +1,16 @@
 // pkg/browser/history.go
 // NavigationHistory tracks back/forward navigation for one browser tab.
-// It is a pure Go structure with no UI dependency; each Tab owns one instance.
+// BrowsingHistoryStore persists the global visited-pages history to disk.
 package browser
 
-import "sync"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
 
 // HistoryEntry is a single visited page.
 type HistoryEntry struct {
@@ -115,4 +122,93 @@ func (h *NavigationHistory) ForwardList() []HistoryEntry {
 	out := make([]HistoryEntry, len(h.forward))
 	copy(out, h.forward)
 	return out
+}
+
+// ── BrowsingHistoryStore ──────────────────────────────────────────────────────
+
+// BrowsingVisit is a single visited page in the global browsing history.
+type BrowsingVisit struct {
+	URL       string    `json:"url"`
+	Title     string    `json:"title"`
+	VisitedAt time.Time `json:"visited_at"`
+}
+
+// BrowsingHistoryStore persists the global list of visited pages.
+// All exported methods are safe for concurrent use.
+type BrowsingHistoryStore struct {
+	mu      sync.Mutex
+	path    string
+	entries []BrowsingVisit
+}
+
+// NewBrowsingHistoryStore opens (or creates) the history file at path.
+// Pass an empty path for an in-memory-only store.
+func NewBrowsingHistoryStore(path string) (*BrowsingHistoryStore, error) {
+	s := &BrowsingHistoryStore{path: path}
+	if err := s.load(); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return s, nil
+}
+
+// Record appends a visit entry, capping at 10 000 entries, then flushes.
+func (s *BrowsingHistoryStore) Record(url, title string) {
+	if url == "" || strings.HasPrefix(url, "data:") || strings.HasPrefix(url, "about:") {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = append(s.entries, BrowsingVisit{URL: url, Title: title, VisitedAt: time.Now().UTC()})
+	if len(s.entries) > 10000 {
+		s.entries = s.entries[len(s.entries)-10000:]
+	}
+	_ = s.flushLocked()
+}
+
+// All returns a snapshot of all visits, newest first.
+func (s *BrowsingHistoryStore) All() []BrowsingVisit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]BrowsingVisit, len(s.entries))
+	for i, e := range s.entries {
+		out[len(s.entries)-1-i] = e
+	}
+	return out
+}
+
+// Clear removes all history and flushes.
+func (s *BrowsingHistoryStore) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = nil
+	_ = s.flushLocked()
+}
+
+func (s *BrowsingHistoryStore) load() error {
+	if s.path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &s.entries)
+}
+
+func (s *BrowsingHistoryStore) flushLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(s.entries)
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }

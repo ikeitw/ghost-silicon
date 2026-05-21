@@ -41,11 +41,12 @@ type WindowOptions struct {
 type Window struct {
 	mw *walk.MainWindow
 
-	webview   *WebViewPanel
-	devtools  *DevToolsPanel
-	bookmarks *BookmarkStore
-	dlMgr     *DownloadManager
-	actions   *Actions
+	webview      *WebViewPanel
+	devtools     *DevToolsPanel
+	bookmarks    *BookmarkStore
+	browsingHist *BrowsingHistoryStore
+	dlMgr        *DownloadManager
+	actions      *Actions
 
 	opts WindowOptions
 	log  *logging.Logger
@@ -134,11 +135,27 @@ func (w *Window) Open() error {
 		return fmt.Errorf("build menu: %w", err)
 	}
 
+	// ── Stores (created before WebView so they can be passed in) ─────────
+	w.dlMgr = NewDownloadManager()
+	bmPath := filepath.Join(w.opts.UserDataDir, bookmarkFile)
+	w.bookmarks, err = NewBookmarkStore(bmPath)
+	if err != nil {
+		w.log.Warn("bookmark store unavailable", "error", err.Error())
+		w.bookmarks, _ = NewBookmarkStore("")
+	}
+	histPath := filepath.Join(w.opts.UserDataDir, "history.json")
+	w.browsingHist, err = NewBrowsingHistoryStore(histPath)
+	if err != nil {
+		w.log.Warn("history store unavailable", "error", err.Error())
+		w.browsingHist, _ = NewBrowsingHistoryStore("")
+	}
+
 	// ── WebView panel (fills entire client area) ──────────────────────────
 	// The browser chrome (toolbar, tabs, address bar) is rendered as a
 	// position:fixed HTML overlay injected into every page by WebViewPanel.
 	// This eliminates all Win32 child-window Z-order / WndProc conflicts.
-	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.log)
+	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.log,
+		w.bookmarks, w.browsingHist, w.dlMgr)
 	if err != nil {
 		return fmt.Errorf("webview panel: %w", err)
 	}
@@ -147,15 +164,6 @@ func (w *Window) Open() error {
 	// unused background window.  Hide it so only the WebView2 window is
 	// visible to the user.
 	win.ShowWindow(mwHWND, win.SW_HIDE)
-
-	// ── Download manager + bookmarks ──────────────────────────────────────
-	w.dlMgr = NewDownloadManager()
-	bmPath := filepath.Join(w.opts.UserDataDir, bookmarkFile)
-	w.bookmarks, err = NewBookmarkStore(bmPath)
-	if err != nil {
-		w.log.Warn("bookmark store unavailable", "error", err.Error())
-		w.bookmarks, _ = NewBookmarkStore("")
-	}
 
 	// ── DevTools ──────────────────────────────────────────────────────────
 	w.devtools = NewDevToolsPanel(w.webview.WebView())

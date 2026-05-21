@@ -94,6 +94,19 @@ func (s *BookmarkStore) UpdateTitle(id, title string) error {
 	return nil
 }
 
+// RemoveByURL deletes the first bookmark matching url and persists.
+func (s *BookmarkStore) RemoveByURL(url string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, b := range s.list {
+		if b.URL == url {
+			s.list = append(s.list[:i], s.list[i+1:]...)
+			return s.flushLocked()
+		}
+	}
+	return nil
+}
+
 // Has reports whether url already has a bookmark.
 func (s *BookmarkStore) Has(url string) bool {
 	s.mu.RLock()

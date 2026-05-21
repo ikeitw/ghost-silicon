@@ -126,6 +126,27 @@ func run() error {
 		return fmt.Errorf("session layout: %w", err)
 	}
 
+	// ── Setup wizard (GUI mode only) ─────────────────────────────────────
+	// Always shown on launch so the user picks an identity before browsing.
+	// Headless mode skips it and uses the stored profile.
+	var searchEngineURL string
+	if !*headless {
+		wizardResult, wizardErr := browser.RunSetupWizard(layout.Root)
+		if wizardErr != nil {
+			return fmt.Errorf("setup wizard: %w", wizardErr)
+		}
+		if wizardResult == nil {
+			return nil // user closed the wizard without launching
+		}
+		activeProfile = wizardResult.Profile
+		searchEngineURL = wizardResult.SearchEngineURL
+		log.Info("setup wizard completed",
+			"profile_name", activeProfile.Name,
+			"os", activeProfile.Hardware.Platform,
+			"search_engine", searchEngineURL,
+		)
+	}
+
 	// ── IPC bridge ───────────────────────────────────────────────────────
 	rpcSrv := jsonrpc.NewServer(log)
 	br := bridge.New(activeProfile, sessionID, log, auditor)
@@ -229,10 +250,11 @@ func run() error {
 
 	// ── GUI MODE ──────────────────────────────────────────────────────────
 	win, err := browser.NewWindow(browser.WindowOptions{
-		Bridge:      br,
-		UserDataDir: layout.Root,
-		PipeName:    cfg.IPC.PipeName,
-		Log:         log,
+		Bridge:          br,
+		UserDataDir:     layout.Root,
+		PipeName:        cfg.IPC.PipeName,
+		SearchEngineURL: searchEngineURL,
+		Log:             log,
 	})
 	if err != nil {
 		return fmt.Errorf("browser window create: %w", err)

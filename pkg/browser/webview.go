@@ -50,8 +50,9 @@ type WebViewPanel struct {
 	log         *logging.Logger
 	userDataDir string
 
-	wndProcCb uintptr // keeps subclassed WndProc callback alive (GC guard)
-	tabsJSON  string  // JSON tab state persisted across navigations
+	wndProcCb       uintptr // keeps subclassed WndProc callback alive (GC guard)
+	tabsJSON        string  // JSON tab state persisted across navigations
+	searchEngineURL string  // URL prefix for address-bar text searches
 
 	// Feature stores wired to JS bindings.
 	bookmarks    *BookmarkStore
@@ -116,20 +117,25 @@ func NewWebViewPanel(
 	mw *walk.MainWindow,
 	br *bridge.Bridge,
 	userDataDir string,
+	searchEngineURL string,
 	log *logging.Logger,
 	bookmarks *BookmarkStore,
 	browsingHist *BrowsingHistoryStore,
 	dlMgr *DownloadManager,
 ) (*WebViewPanel, error) {
+	if searchEngineURL == "" {
+		searchEngineURL = "https://duckduckgo.com/?q="
+	}
 	p := &WebViewPanel{
-		mainWindow:   mw,
-		br:           br,
-		log:          log.WithComponent("webview"),
-		userDataDir:  userDataDir,
-		bookmarks:    bookmarks,
-		browsingHist: browsingHist,
-		dlMgr:        dlMgr,
-		blocker:      NewBlocker(),
+		mainWindow:      mw,
+		br:              br,
+		log:             log.WithComponent("webview"),
+		userDataDir:     userDataDir,
+		searchEngineURL: searchEngineURL,
+		bookmarks:       bookmarks,
+		browsingHist:    browsingHist,
+		dlMgr:           dlMgr,
+		blocker:         NewBlocker(),
 	}
 
 	hwnd := unsafe.Pointer(uintptr(mw.Handle()))
@@ -459,7 +465,7 @@ func (p *WebViewPanel) injectChromeOverlay() {
 	script := fmt.Sprintf(`(function(){
 'use strict';
 try{if(window!==window.top)return;}catch(e){return;}
-var H=82,profile=%q;
+var H=82,profile=%q,_searchURL=%q;
 
 /* ── Style element ──────────────────────────────────────────── */
 var s=document.createElement('style');
@@ -673,7 +679,7 @@ _addr.addEventListener('keydown',function(e){
   var r=_addr.value.trim();if(!r)return;var u=r;
   if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){
     if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}
-    else{u='https://duckduckgo.com/?q='+encodeURIComponent(u);}
+    else{u=_searchURL+encodeURIComponent(u);}
   }
   _ghostGoTo(u);
 });
@@ -836,7 +842,7 @@ function _showCtx(e){
     var short=sel.length>30?sel.slice(0,30)+'…':sel;
     (function(q){
       _cm.appendChild(_ctxItem('Search “'+short+'”',function(){
-        location.href='https://duckduckgo.com/?q='+encodeURIComponent(q);
+        location.href=_searchURL+encodeURIComponent(q);
       }));
     })(sel);
   }
@@ -919,7 +925,7 @@ if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded'
 else{mount();}
 
 setInterval(function(){mount();},500);
-})();`, profileName)
+})();`, profileName, p.searchEngineURL)
 
 	p.wv.Init(script)
 }

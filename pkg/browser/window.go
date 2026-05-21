@@ -31,10 +31,11 @@ const (
 
 // WindowOptions carries everything Window needs at construction time.
 type WindowOptions struct {
-	Bridge      *bridge.Bridge
-	UserDataDir string
-	PipeName    string
-	Log         *logging.Logger
+	Bridge          *bridge.Bridge
+	UserDataDir     string
+	PipeName        string
+	SearchEngineURL string
+	Log             *logging.Logger
 }
 
 // Window is the top-level Ghost-Silicon browser window.
@@ -154,7 +155,7 @@ func (w *Window) Open() error {
 	// The browser chrome (toolbar, tabs, address bar) is rendered as a
 	// position:fixed HTML overlay injected into every page by WebViewPanel.
 	// This eliminates all Win32 child-window Z-order / WndProc conflicts.
-	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.log,
+	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.opts.SearchEngineURL, w.log,
 		w.bookmarks, w.browsingHist, w.dlMgr)
 	if err != nil {
 		return fmt.Errorf("webview panel: %w", err)

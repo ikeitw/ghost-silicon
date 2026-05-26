@@ -158,6 +158,7 @@ func (w *Window) Open() error {
 
 	// ── DevTools ──────────────────────────────────────────────────────────
 	w.devtools = NewDevToolsPanel(w.webview.WebView())
+	w.devtools.OnToggle = func() { w.webview.EmbedDevToolsToggle() }
 	w.devtools.InjectConsoleShortcut(w.actions.DevTools)
 
 	// ── Wire callbacks ────────────────────────────────────────────────────

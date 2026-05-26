@@ -16,27 +16,29 @@ import (
 // No Walk widgets are created — DevTools is a separate OS window owned by
 // the WebView2 runtime.
 type DevToolsPanel struct {
-	wv     webview2.WebView
-	open   bool
-	hotkey *walk.Action // bound in menu.go; toggled here
+	wv       webview2.WebView
+	open     bool
+	hotkey   *walk.Action // bound in menu.go; toggled here
+	OnToggle func()       // if set, called instead of the default openDevToolsWindow
 }
 
 func NewDevToolsPanel(wv webview2.WebView) *DevToolsPanel {
 	return &DevToolsPanel{wv: wv}
 }
 
-// Toggle opens the DevTools window if it is closed, or focuses it if already
-// open.  WebView2 does not expose a way to programmatically close DevTools, so
-// a second call is treated as a focus request.
+// Toggle opens DevTools via ICoreWebView2.OpenDevToolsWindow.
+// WebView2 does not expose a close API, so a second call just re-focuses it.
+// Must be called from the UI thread (Walk action Triggered() satisfies this).
 func (d *DevToolsPanel) Toggle() {
+	if d.OnToggle != nil {
+		d.OnToggle()
+		return
+	}
 	if d.wv == nil {
 		return
 	}
-	d.wv.Dispatch(func() {
-		d.wv.Eval(`window.open = window.open`) // no-op eval to check liveness
-		openDevTools(d.wv)
-		d.open = true
-	})
+	openDevToolsWindow(extractChromium(d.wv))
+	d.open = true
 }
 
 // IsOpen is advisory: the user can close DevTools via its own close button,
@@ -57,27 +59,15 @@ func (d *DevToolsPanel) InjectConsoleShortcut(action *walk.Action) {
 	action.Triggered().Attach(func() { d.Toggle() })
 }
 
-// InspectElement is a convenience that opens DevTools and attempts to
-// highlight the element at the given page coordinates.
+// InspectElement opens DevTools and attempts to highlight the element at (x, y).
 func (d *DevToolsPanel) InspectElement(x, y int) {
 	if d.wv == nil {
 		return
 	}
-	d.wv.Dispatch(func() {
-		openDevTools(d.wv)
-		js := fmt.Sprintf(
-			`if(window.__proto__.inspect){inspect(document.elementFromPoint(%d,%d))}`,
-			x, y,
-		)
-		d.wv.Eval(js)
-		d.open = true
-	})
-}
-
-// openDevTools triggers DevTools by dispatching a synthetic F12 keydown event.
-// go-webview2 doesn't expose ICoreWebView2.OpenDevToolsWindow(); the synthetic
-// key event is the workaround. Replace with a direct COM call if the wrapper
-// ever exposes OpenDevToolsWindow.
-func openDevTools(wv webview2.WebView) {
-	wv.Eval(`(function(){var e=new KeyboardEvent('keydown',{key:'F12',keyCode:123,which:123,bubbles:true});document.dispatchEvent(e)})()`)
+	openDevToolsWindow(extractChromium(d.wv))
+	d.wv.Eval(fmt.Sprintf(
+		`if(window.__proto__.inspect){inspect(document.elementFromPoint(%d,%d))}`,
+		x, y,
+	))
+	d.open = true
 }

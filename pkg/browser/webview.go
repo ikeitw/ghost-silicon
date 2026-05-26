@@ -1,13 +1,13 @@
 //go:build windows
 
-// Package browser — WebView2 embed and browser chrome.
+// Package browser вЂ” WebView2 embed and browser chrome.
 //
 // Architecture (HTML chrome):
 //
 //	go-webview2 top-level window (frameless, subclassed WndProc)
-//	└── WebView2 controller (fills entire client area)
-//	    └── HTML chrome overlay (position:fixed, z-index max)
-//	        — address bar, nav buttons, tab strip — all rendered as HTML
+//	в””в”Ђв”Ђ WebView2 controller (fills entire client area)
+//	    в””в”Ђв”Ђ HTML chrome overlay (position:fixed, z-index max)
+//	        вЂ” address bar, nav buttons, tab strip вЂ” all rendered as HTML
 //
 // The browser chrome (toolbar, tabs, address bar) is implemented as a
 // position:fixed HTML overlay injected into every page via
@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -45,12 +46,12 @@ type wvBrowserSlot struct {
 	_    uintptr // hwnd
 	_    uintptr // mainthread
 	_    uintptr // browser interface: type/itab pointer
-	data uintptr // browser interface: data pointer → *edge.Chromium
+	data uintptr // browser interface: data pointer в†’ *edge.Chromium
 }
 
 // extractChromium reads the *edge.Chromium that go-webview2 stores inside the
 // unexported webview.browser interface field.  Safe only for pinned go-webview2
-// commit dc24628cff85 — the struct layout is stable for that revision.
+// commit dc24628cff85 вЂ” the struct layout is stable for that revision.
 func extractChromium(wv webview2.WebView) *edge.Chromium {
 	slot := (*wvBrowserSlot)(unsafe.Pointer(reflect.ValueOf(wv).Pointer()))
 	if slot.data == 0 {
@@ -59,12 +60,54 @@ func extractChromium(wv webview2.WebView) *edge.Chromium {
 	return (*edge.Chromium)(unsafe.Pointer(slot.data))
 }
 
-// ── WebViewPanel ──────────────────────────────────────────────────────────────
+// openDevToolsVtblIdx is the 0-based index of OpenDevToolsWindow in
+// ICoreWebView2's vtable, counted from iCoreWebView2Vtbl in go-webview2
+// commit dc24628cff85: 3 IUnknown slots + 48 ICoreWebView2 slots before it.
+const openDevToolsVtblIdx = uintptr(51)
+
+// openDevToolsWindow calls ICoreWebView2.OpenDevToolsWindow via direct vtable
+// invocation.  Synthetic DOM F12 events are not intercepted by WebView2 at the
+// browser level, so this is the only reliable way to open DevTools from code.
+// Must be called on the UI/WebView2 thread.
+func openDevToolsWindow(c *edge.Chromium) {
+	if c == nil {
+		return
+	}
+	// Locate edge.Chromium's unexported webview *ICoreWebView2 field by name
+	// so the offset is resolved at runtime rather than hard-coded.
+	t := reflect.TypeOf(*c)
+	var wvOff uintptr
+	found := false
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Name == "webview" {
+			wvOff = t.Field(i).Offset
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	wvPtr := *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(c)) + wvOff))
+	if wvPtr == 0 {
+		return
+	}
+	// vtable_ptr is the first word of the COM object; each slot is 8 bytes.
+	vtbl := *(*uintptr)(unsafe.Pointer(wvPtr))
+	fn := *(*uintptr)(unsafe.Pointer(vtbl + openDevToolsVtblIdx*8))
+	syscall.SyscallN(fn, wvPtr)
+}
+
+// toolbarH is the pixel height of the dedicated toolbar WebView2 window.
+// Content WebView2 rendering always starts at y=toolbarH.
+const toolbarH = 82
+
+// в”Ђв”Ђ WebViewPanel в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 // WebViewPanel wraps a go-webview2 WebView that occupies the entire Walk
 // MainWindow client area.  The browser chrome (toolbar, tabs, address bar) is
-// rendered inside WebView2 as a position:fixed HTML overlay so it is always
-// visible and requires no Win32 child-window management.
+// rendered in a separate toolbar WebView2 pinned above the content WebView2,
+// isolating it from page JavaScript that could hide or break a position:fixed overlay.
 type WebViewPanel struct {
 	mainWindow *walk.MainWindow
 	wv         webview2.WebView
@@ -72,6 +115,13 @@ type WebViewPanel struct {
 	br          *bridge.Bridge
 	log         *logging.Logger
 	userDataDir string
+
+	wvHWND          win.HWND // top-level window created by go-webview2
+	toolbarWv       webview2.WebView
+	toolbarHWND     win.HWND // toolbar child window reparented into wvHWND
+	curURL          string   // last URL reported by the content WebView2
+	devToolsHWND    win.HWND // non-zero once DevTools is reparented into wvHWND
+	devToolsPending bool     // true while the goroutine is waiting for the DevTools HWND
 
 	wndProcCb       uintptr // keeps subclassed WndProc callback alive (GC guard)
 	tabsJSON        string  // JSON tab state persisted across navigations
@@ -91,7 +141,7 @@ type WebViewPanel struct {
 	OnLoadError    func(url, errMsg string)
 }
 
-// ── data types for JS bindings ────────────────────────────────────────────────
+// в”Ђв”Ђ data types for JS bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 type privacyData struct {
 	ProfileName         string  `json:"profileName"`
@@ -174,13 +224,13 @@ func NewWebViewPanel(
 		},
 	})
 	if wv == nil {
-		return nil, fmt.Errorf("webview2: failed to create instance — " +
+		return nil, fmt.Errorf("webview2: failed to create instance вЂ” " +
 			"ensure the WebView2 Runtime (Edge) is installed")
 	}
 	p.wv = wv
 	p.log.Info("webview2 initialised")
 
-	// ── Ad/tracker blocker ────────────────────────────────────────────────
+	// в”Ђв”Ђ Ad/tracker blocker в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	// Wire Blocker.ShouldBlock to WebResourceRequested so the badge counter
 	// reflects real blocked requests and resources are suppressed.
 	if c := extractChromium(p.wv); c != nil {
@@ -203,7 +253,7 @@ func NewWebViewPanel(
 		p.log.Info("ad/tracker blocker wired to WebResourceRequested")
 	}
 
-	// ── Download-shelf push ───────────────────────────────────────────────
+	// в”Ђв”Ђ Download-shelf push в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	// Whenever the download list changes, push updated JSON to the JS shelf.
 	dlMgr.onChange = func() {
 		data, _ := json.Marshal(dlMgr.All())
@@ -211,8 +261,9 @@ func NewWebViewPanel(
 		mw.Synchronize(func() { wv.Eval(js) })
 	}
 
-	// ── Frameless chrome ──────────────────────────────────────────────────
+	// в”Ђв”Ђ Frameless chrome в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
+	p.wvHWND = wvHWND
 	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
 	win.SetWindowLong(wvHWND, win.GWL_STYLE, wvStyle&^win.WS_CAPTION|win.WS_CLIPCHILDREN)
 	win.SetWindowPos(wvHWND, 0, 0, 0, 0, 0,
@@ -226,13 +277,110 @@ func NewWebViewPanel(
 	dwmapi.NewProc("DwmSetWindowAttribute").Call(
 		uintptr(wvHWND), 33, uintptr(unsafe.Pointer(&cornerPref)), 4)
 
-	// ── Window management bindings ────────────────────────────────────────
+	// в”Ђв”Ђ Toolbar WebView2 (isolated 82 px window above content) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// Created separately from the content WebView2 so page scripts can never
+	// interfere with the tab strip or address bar.
+	tbarWv := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug:    false,
+		DataPath: filepath.Join(userDataDir, ".toolbar"),
+		WindowOptions: webview2.WindowOptions{
+			Width:  defaultWindowW,
+			Height: defaultWindowH,
+		},
+	})
+	if tbarWv == nil {
+		return nil, fmt.Errorf("webview2: failed to create toolbar instance")
+	}
+	p.toolbarWv = tbarWv
+	tbHWND := win.HWND(uintptr(tbarWv.Window()))
+	p.toolbarHWND = tbHWND
+
+	// Reparent toolbar window as WS_CHILD of wvHWND (same technique as DevTools).
+	tbStyle := uint32(win.GetWindowLong(tbHWND, win.GWL_STYLE))
+	tbStyle = (tbStyle &^ uint32(win.WS_POPUP) &^ uint32(win.WS_CAPTION) &^
+		uint32(win.WS_THICKFRAME) &^ uint32(win.WS_SYSMENU)) | uint32(win.WS_CHILD)
+	win.SetWindowLong(tbHWND, win.GWL_STYLE, int32(tbStyle))
+	const wsExAppWindow = 0x00040000
+	tbExStyle := win.GetWindowLong(tbHWND, win.GWL_EXSTYLE)
+	win.SetWindowLong(tbHWND, win.GWL_EXSTYLE, tbExStyle&^int32(wsExAppWindow))
+	win.SetParent(tbHWND, wvHWND)
+	win.SetWindowPos(tbHWND, 0, 0, 0, 0, 0,
+		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+	var initCR win.RECT
+	win.GetClientRect(wvHWND, &initCR)
+	win.MoveWindow(tbHWND, 0, 0, initCR.Right, int32(toolbarH), true)
+	win.SetWindowPos(tbHWND, win.HWND_TOP, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
+	win.ShowWindow(tbHWND, win.SW_SHOW)
+
+	// в”Ђв”Ђ Window management bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	const swMaximize = 3
 
-	p.wv.Bind("__ghostMinimize", func() {
+	// в”Ђв”Ђ Debug helper в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	p.wv.Bind("__ghostDebug", func(msg string) {
+		p.log.Info("JS-DEBUG: " + msg)
+	})
+
+	// в”Ђв”Ђ Tab state (persistence only вЂ” live state is owned by toolbar WebView2) в”Ђ
+	p.loadTabsJSON()
+
+	// в”Ђв”Ђ Resize (bottom/side edges вЂ” top edge handled by toolbar WebView2) в”Ђв”Ђв”Ђв”Ђв”Ђ
+	p.wv.Bind("__ghostStartResize", func(ht int) {
+		var pt win.POINT
+		win.GetCursorPos(&pt)
+		lp := uintptr(pt.Y)<<16 | uintptr(uint16(pt.X))
+		win.ReleaseCapture()
+		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, uintptr(ht), lp)
+	})
+
+	// в”Ђв”Ђ Content в†’ toolbar forwarding bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// These let keyboard shortcuts and the context menu in the content WebView2
+	// reach the toolbar WebView2 through Go without any JS-to-JS cross-frame call.
+	p.wv.Bind("__ghostNewTab", func() {
+		p.mainWindow.Synchronize(func() {
+			if p.toolbarWv != nil {
+				p.toolbarWv.Eval("if(typeof _gsNewTab==='function')_gsNewTab();")
+			}
+		})
+	})
+	p.wv.Bind("__ghostCloseTab", func() {
+		p.mainWindow.Synchronize(func() {
+			if p.toolbarWv != nil {
+				p.toolbarWv.Eval("if(typeof _gsCloseCurrentTab==='function')_gsCloseCurrentTab();")
+			}
+		})
+	})
+	p.wv.Bind("__ghostOpenInNewTab", func(url string) {
+		if url == "" || strings.HasPrefix(url, "javascript:") {
+			return
+		}
+		urlJSON, _ := json.Marshal(url)
+		p.mainWindow.Synchronize(func() {
+			if p.toolbarWv != nil {
+				p.toolbarWv.Eval("if(typeof _gsOpenInNewTab==='function')_gsOpenInNewTab(" + string(urlJSON) + ");")
+			}
+		})
+	})
+	p.wv.Bind("__ghostFocusAddr", func() {
+		p.mainWindow.Synchronize(func() {
+			if p.toolbarWv != nil {
+				p.toolbarWv.Eval("(function(){var a=document.getElementById('_gs_addr');if(a){a.focus();a.select();}})()")
+			}
+		})
+	})
+	p.wv.Bind("__ghostToggleBm", func() {
+		p.mainWindow.Synchronize(func() {
+			if p.toolbarWv != nil {
+				p.toolbarWv.Eval("if(typeof _bmToggle==='function')_bmToggle();")
+			}
+		})
+	})
+
+	// в”Ђв”Ђ Toolbar WebView2 bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	p.toolbarWv.Bind("__tbMinimize", func() {
 		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
 	})
-	p.wv.Bind("__ghostMaximize", func() {
+	p.toolbarWv.Bind("__tbMaximize", func() {
 		var wp win.WINDOWPLACEMENT
 		wp.Length = uint32(unsafe.Sizeof(wp))
 		win.GetWindowPlacement(wvHWND, &wp)
@@ -242,56 +390,103 @@ func NewWebViewPanel(
 			win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MAXIMIZE, 0)
 		}
 	})
-	p.wv.Bind("__ghostClose", func() {
+	p.toolbarWv.Bind("__tbClose", func() {
 		win.PostMessage(wvHWND, win.WM_CLOSE, 0, 0)
 	})
-	p.wv.Bind("__ghostStartDrag", func() {
+	p.toolbarWv.Bind("__tbStartDrag", func() {
 		var pt win.POINT
 		win.GetCursorPos(&pt)
 		lp := uintptr(pt.Y)<<16 | uintptr(uint16(pt.X))
 		win.ReleaseCapture()
 		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, win.HTCAPTION, lp)
 	})
-	p.wv.Bind("__ghostIsMaximized", func() bool {
+	p.toolbarWv.Bind("__tbIsMaximized", func() bool {
 		var wp win.WINDOWPLACEMENT
 		wp.Length = uint32(unsafe.Sizeof(wp))
 		win.GetWindowPlacement(wvHWND, &wp)
 		return wp.ShowCmd == swMaximize
 	})
-
-	// ── Debug helper ──────────────────────────────────────────────────────
-	p.wv.Bind("__ghostDebug", func(msg string) {
-		p.log.Info("JS-DEBUG: " + msg)
-	})
-
-	// ── Tab state ─────────────────────────────────────────────────────────
-	p.loadTabsJSON()
-
-	// __ghostGetTabs can't return a value: go-webview2 bindings don't resolve
-	// promises when Walk's mw.Run() drives the loop instead of wv.Run().
-	// Workaround: JS sets window.__ghostTabsCb before calling __ghostGetTabs;
-	// Go calls the callback via Synchronize+Eval, which runs on the UI thread.
-	p.wv.Bind("__ghostGetTabs", func() {
-		data := p.tabsJSON
-		p.mainWindow.Synchronize(func() {
-			p.wv.Eval("if(window.__ghostTabsCb){var _f=window.__ghostTabsCb;window.__ghostTabsCb=null;_f(" + data + ");}")
-		})
-	})
-	p.wv.Bind("__ghostSetTabs", func(j string) {
-		p.tabsJSON = j
-		go p.saveTabsJSON(j)
-	})
-
-	// ── Resize ────────────────────────────────────────────────────────────
-	p.wv.Bind("__ghostStartResize", func(ht int) {
+	p.toolbarWv.Bind("__tbStartResize", func(ht int) {
 		var pt win.POINT
 		win.GetCursorPos(&pt)
 		lp := uintptr(pt.Y)<<16 | uintptr(uint16(pt.X))
 		win.ReleaseCapture()
 		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, uintptr(ht), lp)
 	})
+	p.toolbarWv.Bind("__tbBack", func() {
+		p.mainWindow.Synchronize(func() { p.wv.Eval("history.back()") })
+	})
+	p.toolbarWv.Bind("__tbFwd", func() {
+		p.mainWindow.Synchronize(func() { p.wv.Eval("history.forward()") })
+	})
+	p.toolbarWv.Bind("__tbReload", func() {
+		p.mainWindow.Synchronize(func() { p.wv.Eval("location.reload()") })
+	})
+	p.toolbarWv.Bind("__tbGetTabs", func() {
+		data := p.tabsJSON
+		p.mainWindow.Synchronize(func() {
+			p.toolbarWv.Eval("if(window.__tbTabsCb){var _f=window.__tbTabsCb;window.__tbTabsCb=null;_f(" + data + ");}")
+		})
+	})
+	p.toolbarWv.Bind("__tbSetTabs", func(j string) {
+		p.tabsJSON = j
+		go p.saveTabsJSON(j)
+	})
+	p.toolbarWv.Bind("__tbGoTo", func(url, tabsJSON string) {
+		if tabsJSON == "" {
+			tabsJSON = p.tabsJSON
+		}
+		if strings.HasPrefix(url, "ghost://") {
+			html := p.ghostPageHTML(url)
+			if tabsJSON != "" {
+				html = strings.Replace(html, "</head>",
+					`<script>window.__ghostInitTabs=`+tabsJSON+`;</script></head>`, 1)
+			}
+			dataURL := "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html))
+			p.mainWindow.Synchronize(func() { p.wv.Navigate(dataURL) })
+		} else {
+			p.mainWindow.Synchronize(func() { p.wv.Navigate(url) })
+		}
+	})
+	p.toolbarWv.Bind("__tbAddBookmark", func(url, title string) {
+		_, _ = p.bookmarks.Add(url, title)
+	})
+	p.toolbarWv.Bind("__tbRemoveBookmark", func(url string) {
+		_ = p.bookmarks.RemoveByURL(url)
+	})
+	p.toolbarWv.Bind("__tbGetBookmarks", func() string {
+		data, _ := json.Marshal(p.bookmarks.All())
+		return string(data)
+	})
+	p.toolbarWv.Bind("__tbIsBookmarked", func(url string) bool {
+		return p.bookmarks.Has(url)
+	})
+	p.toolbarWv.Bind("__tbGetBlockedCount", func() int64 {
+		return p.blocker.BlockedCount()
+	})
+	p.toolbarWv.Bind("__tbOpenDevTools", func() {
+		p.mainWindow.Synchronize(func() { p.EmbedDevToolsToggle() })
+	})
+	p.toolbarWv.Bind("__tbToggleDownloads", func() {
+		p.mainWindow.Synchronize(func() {
+			p.wv.Eval("if(typeof _gsDlToggle==='function')_gsDlToggle();")
+		})
+	})
+	p.toolbarWv.Bind("__tbOnLoad", func() {
+		if p.curURL == "" {
+			return
+		}
+		url := p.curURL
+		p.mainWindow.Synchronize(func() {
+			urlJSON, _ := json.Marshal(url)
+			p.toolbarWv.Eval("if(typeof _tbNavUpdate==='function')_tbNavUpdate(" + string(urlJSON) + ")")
+		})
+	})
+	p.toolbarWv.Bind("__tbDebug", func(msg string) {
+		p.log.Info("TB-DEBUG: " + msg)
+	})
 
-	// ── Bookmark bindings ─────────────────────────────────────────────────
+	// в”Ђв”Ђ Bookmark bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostAddBookmark", func(url, title string) {
 		_, _ = p.bookmarks.Add(url, title)
 		p.mainWindow.Synchronize(func() {
@@ -312,7 +507,7 @@ func NewWebViewPanel(
 		return p.bookmarks.Has(url)
 	})
 
-	// ── History bindings ──────────────────────────────────────────────────
+	// в”Ђв”Ђ History bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostRecordHistory", func(url, title string) {
 		p.browsingHist.Record(url, title)
 	})
@@ -327,7 +522,7 @@ func NewWebViewPanel(
 		p.browsingHist.Clear()
 	})
 
-	// ── Download bindings ─────────────────────────────────────────────────
+	// в”Ђв”Ђ Download bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostGetDownloads", func() string {
 		data, _ := json.Marshal(p.dlMgr.All())
 		return string(data)
@@ -343,12 +538,21 @@ func NewWebViewPanel(
 		_ = exec.Command("explorer", "/select,", path).Start()
 	})
 
-	// ── Blocker bindings ──────────────────────────────────────────────────
+	// в”Ђв”Ђ Blocker bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostGetBlockedCount", func() int64 {
 		return p.blocker.BlockedCount()
 	})
 
-	// ── Privacy bindings ──────────────────────────────────────────────────
+	// в”Ђв”Ђ DevTools binding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// Called from the HTML context menu and the F12 action.
+	// JS bindings run in a goroutine, so Synchronize onto the UI thread first.
+	p.wv.Bind("__ghostOpenDevTools", func() {
+		p.mainWindow.Synchronize(func() {
+			p.EmbedDevToolsToggle()
+		})
+	})
+
+	// в”Ђв”Ђ Privacy bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostGetPrivacyData", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -371,7 +575,7 @@ func NewWebViewPanel(
 		return string(b)
 	})
 
-	// ── Settings bindings ─────────────────────────────────────────────────
+	// в”Ђв”Ђ Settings bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostGetProfile", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -418,7 +622,7 @@ func NewWebViewPanel(
 		}
 	})
 
-	// ── Profile switcher bindings ─────────────────────────────────────────
+	// в”Ђв”Ђ Profile switcher bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostListProfiles", func() string {
 		prof := p.br.Profile()
 		items := []profileListItem{{
@@ -435,32 +639,8 @@ func NewWebViewPanel(
 		p.log.Info("ghost switch profile", "id", id)
 	})
 
-	// ── Navigate binding ──────────────────────────────────────────────────
+	// в”Ђв”Ђ Navigate binding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 	p.wv.Bind("__ghostNavigate", p.handleGhostScheme)
-	// __ghostGoTo(url, tabsJSON): navigates to a ghost:// page via Go.
-	// tabsJSON comes from JS (_T) rather than p.tabsJSON to avoid a race with
-	// the goroutine spawned by __ghostSetTabs.  JS always holds the canonical
-	// tab state; p.tabsJSON is only a persistence buffer.
-	// p.wv.Dispatch() can't be used here because wv.Run() is never called —
-	// Walk's mw.Run() drives the loop, so Synchronize is the only safe way to
-	// post work onto the WebView2 thread.
-	p.wv.Bind("__ghostGoTo", func(url, tabsJSON string) {
-		if !strings.HasPrefix(url, "ghost://") {
-			return
-		}
-		html := p.ghostPageHTML(url)
-		if tabsJSON == "" {
-			tabsJSON = p.tabsJSON
-		}
-		if tabsJSON != "" {
-			script := `<script>window.__ghostInitTabs=` + tabsJSON + `;</script>`
-			html = strings.Replace(html, "</head>", script+"</head>", 1)
-		}
-		dataURL := "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html))
-		p.mainWindow.Synchronize(func() {
-			p.wv.Navigate(dataURL)
-		})
-	})
 
 	if err := p.injectPolyfill(); err != nil {
 		p.log.Warn("polyfill injection failed", "error", err.Error())
@@ -470,10 +650,28 @@ func NewWebViewPanel(
 	p.injectKeyboardShortcuts()
 	p.bindEventBridge()
 
+	// в”Ђв”Ђ Initial layout: content below toolbar в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	{
+		var cr win.RECT
+		win.GetClientRect(wvHWND, &cr)
+		p.setWebViewBounds(0, toolbarH, int(cr.Right), int(cr.Bottom))
+	}
+
+	// в”Ђв”Ђ Navigate toolbar to its standalone HTML page в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	{
+		html := p.ghostToolbarPage()
+		if p.tabsJSON != "" {
+			html = strings.Replace(html, "</head>",
+				`<script>window.__tbInitTabs=`+p.tabsJSON+`;</script></head>`, 1)
+		}
+		p.toolbarWv.Navigate("data:text/html;base64," +
+			base64.StdEncoding.EncodeToString([]byte(html)))
+	}
+
 	return p, nil
 }
 
-// ── navigation ────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ navigation в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 func (p *WebViewPanel) Navigate(url string) {
 	if p.wv == nil {
@@ -482,6 +680,14 @@ func (p *WebViewPanel) Navigate(url string) {
 	p.log.Info("navigate", "url", url)
 	if strings.HasPrefix(url, "ghost://") {
 		p.wv.Navigate("data:text/html;base64," + p.ghostPageDataURL(url))
+		// Push the pretty ghost:// URL to the toolbar address bar immediately,
+		// because the content WebView2 will only report a data: URL via __ghostOnURL.
+		if p.toolbarWv != nil {
+			urlJSON, _ := json.Marshal(url)
+			p.mainWindow.Synchronize(func() {
+				p.toolbarWv.Eval("if(typeof _tbNavUpdate==='function')_tbNavUpdate(" + string(urlJSON) + ")")
+			})
+		}
 		return
 	}
 	p.wv.Navigate(url)
@@ -534,437 +740,30 @@ func (p *WebViewPanel) UpdateProfile() {
 	}
 }
 
-// ── HTML chrome overlay ───────────────────────────────────────────────────────
+// в”Ђв”Ђ Minimal content overlay в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// The browser chrome (toolbar, tabs, address bar) now lives in a dedicated
+// toolbar WebView2.  This overlay only provides: context menu, window.open /
+// target=_blank intercepts, download shelf, and the find bar.
 
 func (p *WebViewPanel) injectChromeOverlay() {
-	profileName := p.br.Profile().Name
-
 	script := fmt.Sprintf(`(function(){
 'use strict';
 try{if(window!==window.top)return;}catch(e){return;}
-var H=82,profile=%q,_searchURL=%q;
+var _searchURL=%q;
 
-/* ── Style element ──────────────────────────────────────────── */
-var s=document.createElement('style');
-s.id='_gs_st';
-s.textContent=
-  '#_gs_toolbar *,#_gs_bm_bar *{box-sizing:border-box!important}'+
-  '#_gs_toolbar{position:fixed;top:0;left:0;right:0;height:'+H+'px;'+
-  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
-  'border-bottom:1px solid rgba(255,255,255,.1);z-index:2147483647;'+
-  'display:flex;flex-direction:column;box-shadow:0 2px 12px rgba(0,0,0,.5)}'+
-  '#_gs_tabs{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;gap:0;'+
-  'overflow:hidden;-webkit-app-region:drag}'+
-  '#_gs_tablist{display:flex;align-items:flex-end;gap:2px;overflow:hidden;flex:1;min-width:0}'+
-  '#_gs_new_tab,#_gs_wm_btns,._gs_wm_btn{-webkit-app-region:no-drag}'+
-  '._gst{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.12);border-bottom:none;'+
-  'border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex!important;align-items:center;'+
-  'font-size:12px;color:rgba(255,255,255,.6);max-width:180px;min-width:80px;cursor:pointer;'+
-  '-webkit-app-region:no-drag;flex-shrink:0!important;'+
-  'transition:background .18s ease,color .18s ease,border-color .18s ease}'+
-  '._gst._gst_a{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.28)}'+
-  '._gst:hover:not(._gst_a){background:rgba(255,255,255,.15);color:rgba(255,255,255,.9)}'+
-  '._gst>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}'+
-  '._gst_x{background:transparent!important;border:none!important;color:rgba(255,255,255,.35)!important;font-size:11px!important;'+
-  'padding:0 3px!important;margin-left:2px!important;border-radius:3px!important;flex-shrink:0!important;line-height:1.5!important;'+
-  'transition:background .15s ease,color .15s ease}'+
-  '._gst_x:hover{background:rgba(255,255,255,.18)!important;color:#fff!important}'+
-  '._gst_fav{width:14px!important;height:14px!important;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain;'+
-  'transition:opacity .15s ease}'+
-  '#_gs_new_tab{background:transparent!important;border:none!important;color:rgba(255,255,255,.55)!important;'+
-  'font-size:20px!important;padding:0 8px!important;border-radius:50%%!important;align-self:center!important;line-height:1!important;flex-shrink:0!important;'+
-  'transition:background .15s ease,color .15s ease,transform .12s ease}'+
-  '#_gs_new_tab:hover{background:rgba(255,255,255,.14)!important;color:#fff!important;transform:scale(1.12)}'+
-  '#_gs_nav{height:44px;display:flex!important;align-items:center!important;padding:0 10px;gap:6px}'+
-  '._gs_btn{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
-  'font-size:16px!important;color:rgba(255,255,255,.7)!important;display:flex!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;'+
-  'transition:background .15s ease,color .15s ease,transform .1s ease}'+
-  '._gs_btn:hover{background:rgba(255,255,255,.14)!important;color:#fff!important;transform:scale(1.1)}'+
-  '._gs_btn:active{transform:scale(.93)}'+
-  '#_gs_addr{flex:1!important;height:30px!important;border:1px solid rgba(255,255,255,.18)!important;border-radius:15px!important;'+
-  'padding:0 14px!important;font-size:13px!important;background:rgba(255,255,255,.10)!important;color:#fff!important;outline:none!important;'+
-  'transition:border-color .2s ease,background .2s ease,box-shadow .2s ease}'+
-  '#_gs_addr::placeholder{color:rgba(255,255,255,.35)}'+
-  '#_gs_addr:focus{border-color:rgba(130,150,255,.75)!important;background:rgba(255,255,255,.16)!important;'+
-  'box-shadow:0 0 0 2px rgba(130,150,255,.18)!important}'+
-  '#_gs_bm{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
-  'font-size:16px!important;color:rgba(255,255,255,.4)!important;display:flex!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;'+
-  'transition:background .15s ease,color .15s ease,transform .12s ease}'+
-  '#_gs_bm:hover{background:rgba(255,255,255,.13)!important;color:#F4A460!important;transform:scale(1.1)}'+
-  '#_gs_bm._bm_on{color:#F4A460!important}'+
-  '#_gs_badge{min-width:28px!important;height:22px!important;border-radius:11px!important;background:rgba(244,164,96,.10)!important;'+
-  'border:1px solid rgba(244,164,96,.22)!important;color:rgba(244,164,96,.65)!important;font-size:11px!important;font-weight:600!important;'+
-  'display:flex!important;align-items:center!important;justify-content:center!important;padding:0 5px!important;cursor:pointer!important;'+
-  'flex-shrink:0!important;user-select:none;transition:background .15s ease,color .15s ease}'+
-  '#_gs_badge:hover{background:rgba(244,164,96,.2)!important;color:#F4A460!important}'+
-  '#_gs_wm_btns{display:flex!important;align-items:stretch!important;margin-left:auto;height:38px;-webkit-app-region:no-drag}'+
-  '._gs_wm_btn{background:transparent!important;border:none!important;width:46px!important;height:100%%!important;'+
-  'color:rgba(255,255,255,.8)!important;font-size:13px!important;'+
-  'display:flex!important;align-items:center!important;justify-content:center!important;'+
-  'transition:background .15s ease,color .15s ease}'+
-  '._gs_wm_btn:hover{background:rgba(255,255,255,.18)!important}'+
-  '#_gs_cls:hover{background:#E81123!important;color:#fff!important}'+
-  'body{padding-top:'+H+'px!important}'+
-  // ── bookmark bar ───────────────────────────────────────────────────────
-  '#_gs_bm_bar{position:fixed;top:'+H+'px;left:0;right:0;height:28px;'+
-  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
-  'border-bottom:1px solid rgba(255,255,255,.08);z-index:2147483646;'+
-  'display:none;align-items:center;padding:0 10px;gap:4px;overflow:hidden}'+
-  '._gs_bmi{height:22px!important;border-radius:4px!important;padding:0 9px!important;'+
-  'background:rgba(255,255,255,.07)!important;color:rgba(255,255,255,.75)!important;font-size:12px!important;'+
-  'white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;max-width:140px!important;'+
-  'display:inline-flex!important;align-items:center!important;flex-shrink:0!important;'+
-  'transition:background .14s ease,color .14s ease}'+
-  '._gs_bmi:hover{background:rgba(255,255,255,.18)!important;color:#fff!important}'+
-  // ── download shelf ─────────────────────────────────────────────────────
-  '#_gs_dl_shelf{position:fixed;bottom:0;left:0;right:0;z-index:2147483646;'+
+/* в”Ђв”Ђ Download shelf в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+var _dlShelf=document.createElement('div');_dlShelf.id='_gs_dl_shelf';
+_dlShelf.style.cssText=
+  'position:fixed;bottom:0;left:0;right:0;z-index:2147483646;'+
   'background:rgba(18,18,44,.97);border-top:1px solid rgba(255,255,255,.1);'+
   'transform:translateY(100%%);transition:transform .22s cubic-bezier(0.4,0,0.2,1);'+
   'padding:10px 16px 14px;display:flex;flex-direction:column;gap:6px;'+
-  'max-height:220px;overflow-y:auto}'+
-  '._gs_dl_row{display:flex;flex-direction:column;gap:2px;padding:2px 0;'+
-  'border-bottom:1px solid rgba(255,255,255,.05)}'+
-  '._gs_dl_hdr{display:flex;align-items:center;gap:6px}'+
-  '._gs_dl_nm{font-size:12px;color:#E8E8F4;overflow:hidden;text-overflow:ellipsis;'+
-  'white-space:nowrap;flex:1;min-width:0}'+
-  '._gs_dl_stat{font-size:11px;color:rgba(255,255,255,.45);flex-shrink:0}'+
-  '._gs_dl_trk{height:3px;background:rgba(255,255,255,.1);border-radius:2px;'+
-  'overflow:hidden;margin-top:3px}'+
-  '._gs_dl_fill{height:100%%;background:linear-gradient(90deg,#7B61FF,#B89CFF);'+
-  'border-radius:2px;transition:width .4s ease}'+
-  '#_gs_dl_hdr_row{display:flex;justify-content:space-between;align-items:center;'+
-  'padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:4px}'+
-  '#_gs_dl_title{font-size:12px;font-weight:600;color:rgba(255,255,255,.7)}'+
-  '#_gs_dl_x{background:transparent;border:none;color:rgba(255,255,255,.4);'+
-  'font-size:13px;cursor:pointer;padding:0 4px;border-radius:3px;'+
-  'transition:color .12s ease}'+
-  '#_gs_dl_x:hover{color:#fff}'+
-  // ── download button in nav ─────────────────────────────────────────────
-  '#_gs_dl_btn{background:transparent!important;border:none!important;width:28px!important;height:28px!important;border-radius:50%%!important;'+
-  'font-size:14px!important;color:rgba(255,255,255,.6)!important;display:flex!important;align-items:center!important;'+
-  'justify-content:center!important;flex-shrink:0!important;transition:background .15s ease,color .15s ease}'+
-  '#_gs_dl_btn:hover{background:rgba(255,255,255,.14)!important;color:#fff!important}';
-
-/* ── Toolbar element ────────────────────────────────────────── */
-var bar=document.createElement('div');
-bar.id='_gs_toolbar';
-bar.innerHTML=
-  '<div id="_gs_tabs"><div id="_gs_tablist">'+
-  '<div class="_gst _gst_a"><span id="_gs_tab_title">Loading…</span>'+
-  '<button class="_gst_x" style="display:none">&#10005;</button></div>'+
-  '</div>'+
-  '<button id="_gs_new_tab" title="New Tab (Ctrl+T)">+</button>'+
-  '<div id="_gs_wm_btns">'+
-  '<button class="_gs_wm_btn" id="_gs_min" title="Minimise">&#8212;</button>'+
-  '<button class="_gs_wm_btn" id="_gs_max" title="Maximise">&#9633;</button>'+
-  '<button class="_gs_wm_btn" id="_gs_cls" title="Close">&#10005;</button>'+
-  '</div></div>'+
-  '<div id="_gs_nav">'+
-  '<button class="_gs_btn" id="_gs_back" title="Back">&#8592;</button>'+
-  '<button class="_gs_btn" id="_gs_fwd" title="Forward">&#8594;</button>'+
-  '<button class="_gs_btn" id="_gs_reload" title="Reload">&#8635;</button>'+
-  '<input id="_gs_addr" type="text" spellcheck="false" placeholder="Search or enter address"/>'+
-  '<button id="_gs_bm" title="Bookmark (Ctrl+D)">☆</button>'+
-  '<div id="_gs_badge" title="Blocked trackers">0</div>'+
-  '<button id="_gs_dl_btn" title="Downloads">&#8595;</button>'+
-  '</div>';
-
-bar.style.cssText=
-  'position:fixed;top:0;left:0;right:0;'+
-  'height:'+H+'px;z-index:2147483647;'+
-  'display:flex;flex-direction:column;'+
-  'background:linear-gradient(90deg,#3D1A0A 0%%,#2A1560 40%%,#0A1A6B 70%%,#050E40 100%%);'+
-  'border-bottom:1px solid rgba(255,255,255,.1);box-shadow:0 2px 12px rgba(0,0,0,.5)';
-
-/* ── Direct element refs ────────────────────────────────────── */
-var _tablist=bar.querySelector('#_gs_tablist');
-var _addr=bar.querySelector('#_gs_addr');
-var _tabTitle=bar.querySelector('#_gs_tab_title');
-var _bmEl=bar.querySelector('#_gs_bm');
-var _badgeEl=bar.querySelector('#_gs_badge');
-var _dlBtn=bar.querySelector('#_gs_dl_btn');
-
-/* ── Lock button sizes as inline !important — beats any page CSS ─ */
-(function(){
-  var I='important';
-  function _lock(el,w,h){
-    if(!el)return;
-    el.style.setProperty('width',w,I);
-    el.style.setProperty('height',h,I);
-    el.style.setProperty('min-width','0',I);
-    el.style.setProperty('min-height','0',I);
-    el.style.setProperty('max-width','none',I);
-    el.style.setProperty('max-height','none',I);
-    el.style.setProperty('background','transparent',I);
-    el.style.setProperty('border','none',I);
-    el.style.setProperty('padding','0',I);
-    el.style.setProperty('display','flex',I);
-    el.style.setProperty('align-items','center',I);
-    el.style.setProperty('justify-content','center',I);
-    el.style.setProperty('flex-shrink','0',I);
-  }
-  _lock(bar.querySelector('#_gs_back'),'28px','28px');
-  _lock(bar.querySelector('#_gs_fwd'),'28px','28px');
-  _lock(bar.querySelector('#_gs_reload'),'28px','28px');
-  _lock(_bmEl,'28px','28px');
-  _lock(_dlBtn,'28px','28px');
-  _lock(bar.querySelector('#_gs_new_tab'),'32px','32px');
-  bar.querySelectorAll('._gs_wm_btn').forEach(function(b){
-    b.style.setProperty('width','46px',I);
-    b.style.setProperty('height','100%%',I);
-    b.style.setProperty('background','transparent',I);
-    b.style.setProperty('border','none',I);
-    b.style.setProperty('padding','0',I);
-    b.style.setProperty('display','flex',I);
-    b.style.setProperty('align-items','center',I);
-    b.style.setProperty('justify-content','center',I);
-    b.style.setProperty('flex-shrink','0',I);
-  });
-  _addr.style.setProperty('flex','1',I);
-  _addr.style.setProperty('height','30px',I);
-  _addr.style.setProperty('min-width','0',I);
-})();
-
-/* ── Bookmark bar (separate fixed element below toolbar) ────── */
-var _bmBar=document.createElement('div');_bmBar.id='_gs_bm_bar';
-var _HBM=28,_bmBarOn=false;
-
-/* ── Download shelf (slides up from bottom) ─────────────────── */
-var _dlShelf=document.createElement('div');_dlShelf.id='_gs_dl_shelf';
+  'max-height:220px;overflow-y:auto;font-family:Segoe UI,system-ui,sans-serif;'+
+  'font-size:12px;color:#E8E8F4;box-sizing:border-box';
 _dlShelf.innerHTML=
-  '<div id="_gs_dl_hdr_row">'+
-  '<span id="_gs_dl_title">Downloads</span>'+
-  '<button id="_gs_dl_x" title="Close">&#10005;</button></div>';
-
-/* ── Tab state ──────────────────────────────────────────────── */
-var _T={tabs:[],current:0};var _loaded=false;var _loadQ=[];
-function _url(){return window.__ghostPageURL||location.href;}
-function _load(cb){
-  if(_loaded){if(cb)cb();return;}
-  if(cb)_loadQ.push(cb);
-  if(_loadQ.length>1)return;
-  // Fast path: Go pre-injected tab state into the ghost:// page HTML.
-  if(window.__ghostInitTabs&&window.__ghostInitTabs.tabs&&window.__ghostInitTabs.tabs.length){
-    _T=window.__ghostInitTabs;
-    _loaded=true;var q0=_loadQ.splice(0);q0.forEach(function(f){try{f();}catch(_){}});
-    return;
-  }
-  // Slow path: regular web page — ask Go via callback.
-  window.__ghostTabsCb=function(obj){
-    _T=(obj&&obj.tabs&&obj.tabs.length)?obj:{tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};
-    _loaded=true;var q=_loadQ.splice(0);q.forEach(function(f){try{f();}catch(_){}});
-  };
-  try{__ghostGetTabs();}catch(e){
-    window.__ghostTabsCb=null;
-    if(!_T||!_T.tabs||!_T.tabs.length){_T={tabs:[{id:1,url:_url(),title:'New Tab'}],current:1};}
-    _loaded=true;var q2=_loadQ.splice(0);q2.forEach(function(f){try{f();}catch(_){}});
-  }
-}
-function _save(){try{__ghostSetTabs(JSON.stringify(_T));}catch(_){}}
-function _render(){
-  if(!_T.tabs||!_T.tabs.length)return;
-  var kids=_tablist.children;
-  if(kids.length===_T.tabs.length){
-    // Fast path: same number of tabs — update attributes in place, no DOM rebuild.
-    for(var i=0;i<_T.tabs.length;i++){
-      var t=_T.tabs[i];var el=kids[i];
-      var active=t.id===_T.current;
-      var wantCls=active?'_gst _gst_a':'_gst';
-      if(el.className!==wantCls)el.className=wantCls;
-      var sp=el.querySelector('span');var ttl=t.title||'New Tab';
-      if(sp&&sp.textContent!==ttl){sp.textContent=ttl;sp.title=ttl;}
-      var fav=el.querySelector('._gst_fav');
-      if(fav){
-        var http=t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'));
-        if(http){try{var h=new URL(t.url).hostname;
-          if(fav.getAttribute('data-h')!==h){
-            fav.setAttribute('data-h',h);
-            fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
-            fav.style.display='';
-            fav.onerror=function(){this.style.display='none';};
-          }
-        }catch(_){fav.style.display='none';}}
-        else{fav.style.display='none';}
-      }
-    }
-    return;
-  }
-  // Full rebuild — only runs when tab count changes (open/close).
-  _tablist.innerHTML='';
-  _T.tabs.forEach(function(t){
-    var el=document.createElement('div');
-    el.className=t.id===_T.current?'_gst _gst_a':'_gst';
-    var fav=document.createElement('img');fav.className='_gst_fav';
-    if(t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'))){
-      try{var h=new URL(t.url).hostname;
-        fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
-        fav.setAttribute('data-h',h);
-        fav.onerror=function(){fav.style.display='none';};
-      }catch(_){fav.style.display='none';}
-    }else{fav.style.display='none';}
-    var sp=document.createElement('span');sp.textContent=t.title||'New Tab';sp.title=t.title||'';
-    var xb=document.createElement('button');xb.className='_gst_x';xb.innerHTML='&#10005;';xb.title='Close';
-    el.appendChild(fav);el.appendChild(sp);el.appendChild(xb);
-    (function(id){
-      el.addEventListener('click',function(e){if(xb.contains(e.target))return;_switchTab(id);});
-      xb.addEventListener('click',function(e){e.stopPropagation();_closeTab(id);});
-    })(t.id);
-    _tablist.appendChild(el);
-  });
-}
-function _updateCur(){
-  var u=_url(),ti=document.title||location.hostname||'New Tab';
-  for(var i=0;i<_T.tabs.length;i++){
-    if(_T.tabs[i].id===_T.current){
-      _T.tabs[i].url=u;_T.tabs[i].title=ti;
-      break;
-    }
-  }
-}
-/* ── Navigation: ghost:// pages must go through Go to get tab state injected ─ */
-function _ghostGoTo(url){
-  if(url.startsWith('ghost://')){
-    try{__ghostGoTo(url,JSON.stringify(_T));}catch(e){console.error('[ghost] __ghostGoTo threw:',e);}
-  }else{location.href=url;}
-}
-function _switchTab(id){
-  _updateCur();_T.current=id;_save();_render();
-  for(var i=0;i<_T.tabs.length;i++){
-    if(_T.tabs[i].id===id){
-      if(_T.tabs[i].url===_url())return;
-      _ghostGoTo(_T.tabs[i].url);return;
-    }
-  }
-}
-window._gsNewTab=function(){
-  console.log('[ghost] _gsNewTab _loaded='+_loaded+' tabs='+((_T&&_T.tabs)?_T.tabs.length:0));
-  try{__ghostDebug('_gsNewTab loaded='+_loaded+' tabs='+((_T&&_T.tabs)?_T.tabs.length:0));}catch(_){}
-  if(!_loaded){_load(function(){window._gsNewTab();});return;}
-  try{__ghostDebug('_gsNewTab proceeding to create tab');}catch(_){}
-  _updateCur();
-  var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
-  var id=mx+1;_T.tabs.push({id:id,url:'ghost://newtab',title:'New Tab'});
-  _T.current=id;_save();_render();
-  _ghostGoTo('ghost://newtab');
-};
-window._gsCloseCurrentTab=function(){_closeTab(_T.current);};
-// Opens url in a new tab — used by window.open override and target=_blank intercept.
-window._gsOpenInNewTab=function(url){
-  if(!url||url.startsWith('javascript:'))return;
-  if(!_loaded){_load(function(){window._gsOpenInNewTab(url);});return;}
-  _updateCur();
-  var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
-  var id=mx+1;_T.tabs.push({id:id,url:url,title:'New Tab'});
-  _T.current=id;_save();_render();
-  _ghostGoTo(url);
-};
-function _closeTab(id){
-  if(_T.tabs.length<=1){try{__ghostClose();}catch(_){}return;}
-  var idx=-1;for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){idx=i;break;}}
-  if(idx<0)return;
-  var wa=(id===_T.current);
-  _T.tabs.splice(idx,1);
-  if(wa){var ni=Math.min(idx,_T.tabs.length-1);_T.current=_T.tabs[ni].id;_save();_render();_ghostGoTo(_T.tabs[ni].url);}
-  else{_save();_render();}
-}
-
-/* ── Window-button event listeners ─────────────────────────── */
-function _mx(){
-  var b=bar.querySelector('#_gs_max');if(!b)return;
-  try{__ghostIsMaximized().then(function(m){
-    b.innerHTML=m?'&#10064;':'&#9633;';b.title=m?'Restore':'Maximise';
-  });}catch(_){}
-}
-_mx();
-window.addEventListener('resize',_mx);
-bar.querySelector('#_gs_tabs').addEventListener('mousedown',function(e){
-  if(e.button===0&&!e.target.closest('button,input,a,._gst')){try{__ghostStartDrag();}catch(_){}}
-});
-bar.querySelector('#_gs_back').addEventListener('click',function(){history.back();});
-bar.querySelector('#_gs_fwd').addEventListener('click',function(){history.forward();});
-bar.querySelector('#_gs_reload').addEventListener('click',function(){location.reload();});
-bar.querySelector('#_gs_new_tab').addEventListener('click',function(){
-  try{__ghostDebug('new-tab-btn-click');}catch(_){}
-  _gsNewTab();
-});
-bar.querySelector('#_gs_min').addEventListener('click',function(){try{__ghostMinimize();}catch(e){}});
-bar.querySelector('#_gs_max').addEventListener('click',function(){_mx();try{__ghostMaximize();}catch(e){}});
-bar.querySelector('#_gs_cls').addEventListener('click',function(){try{__ghostClose();}catch(e){}});
-_addr.addEventListener('keydown',function(e){
-  if(e.key!=='Enter')return;e.preventDefault();
-  var r=_addr.value.trim();if(!r)return;var u=r;
-  if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){
-    if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}
-    else{u=_searchURL+encodeURIComponent(u);}
-  }
-  _ghostGoTo(u);
-});
-_addr.addEventListener('focus',function(){_addr.select();});
-
-/* ── Bookmarks ──────────────────────────────────────────────── */
-function _bmUpdate(){
-  var u=_url();
-  if(!u||u.startsWith('ghost://')||u.startsWith('data:')){
-    _bmEl.textContent='☆';_bmEl.classList.remove('_bm_on');
-    _bmEl.style.opacity='0.25';_bmEl.title='Cannot bookmark internal pages';return;
-  }
-  _bmEl.style.opacity='';_bmEl.title='Bookmark (Ctrl+D)';
-  try{__ghostIsBookmarked(u).then(function(yes){
-    _bmEl.textContent=yes?'★':'☆';
-    if(yes)_bmEl.classList.add('_bm_on');else _bmEl.classList.remove('_bm_on');
-  });}catch(_){}
-}
-function _bmToggle(){
-  var u=_url(),ti=document.title||'';
-  console.log('[ghost] _bmToggle url='+u);
-  if(!u||u.startsWith('ghost://')||u.startsWith('data:'))return;
-  if(_bmEl.classList.contains('_bm_on')){
-    _bmEl.textContent='☆';_bmEl.classList.remove('_bm_on');
-    try{__ghostRemoveBookmark(u);}catch(_){}
-  }else{
-    _bmEl.textContent='★';_bmEl.classList.add('_bm_on');
-    try{__ghostAddBookmark(u,ti);}catch(_){}
-  }
-}
-_bmEl.addEventListener('click',_bmToggle);
-window._gsBmToggle=_bmToggle;
-
-/* ── Blocked count badge ────────────────────────────────────── */
-function _badgeUpdate(){
-  try{__ghostGetBlockedCount().then(function(n){
-    _badgeEl.textContent=n||0;
-    _badgeEl.title='Blocked trackers: '+(n||0);
-  });}catch(_){}
-}
-_badgeEl.addEventListener('click',function(){console.log('[ghost] badge clicked');_ghostGoTo('ghost://privacy');});
-setInterval(_badgeUpdate,2000);
-
-/* ── Bookmark bar ────────────────────────────────────────────── */
-function _bmBarUpdate(){
-  try{__ghostGetBookmarks().then(function(s){
-    var bms;try{bms=JSON.parse(s||'[]');}catch(_){bms=[];}
-    _bmBar.innerHTML='';
-    if(bms&&bms.length){
-      bms.forEach(function(bm){
-        var a=document.createElement('button');a.className='_gs_bmi';
-        a.textContent=bm.title||bm.url;a.title=bm.url;
-        a.addEventListener('click',function(){_ghostGoTo(bm.url);});
-        _bmBar.appendChild(a);
-      });
-      if(!_bmBarOn){
-        _bmBarOn=true;_bmBar.style.display='flex';
-        try{if(document.body)document.body.style.setProperty('padding-top',(H+_HBM)+'px','important');}catch(_){}
-      }
-    }else{
-      if(_bmBarOn){
-        _bmBarOn=false;_bmBar.style.display='none';
-        try{if(document.body)document.body.style.setProperty('padding-top',H+'px','important');}catch(_){}
-      }
-    }
-  });}catch(_){}
-}
-
-/* ── Download shelf ──────────────────────────────────────────── */
+  '<div id="_gs_dl_hdr_row" style="display:flex;justify-content:space-between;align-items:center;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:4px">'+
+  '<span style="font-size:12px;font-weight:600;color:rgba(255,255,255,.7)">Downloads</span>'+
+  '<button id="_gs_dl_x" style="background:transparent;border:none;color:rgba(255,255,255,.4);font-size:13px;cursor:pointer;padding:0 4px;border-radius:3px">&#10005;</button></div>';
 function _dlMountShelf(){
   if(!document.getElementById('_gs_dl_shelf')){
     try{document.documentElement.appendChild(_dlShelf);}catch(_){return;}
@@ -972,180 +771,81 @@ function _dlMountShelf(){
     if(x)x.addEventListener('click',function(){_dlClose();});
   }
 }
-function _dlOpen(){
-  _dlMountShelf();
-  _dlShelf.style.transform='translateY(0)';
-  if(_dlBtn)_dlBtn.style.color='#7B61FF';
-}
-function _dlClose(){
-  _dlShelf.style.transform='translateY(100%%)';
-  if(_dlBtn)_dlBtn.style.color='';
-}
+function _dlOpen(){_dlMountShelf();_dlShelf.style.transform='translateY(0)';}
+function _dlClose(){_dlShelf.style.transform='translateY(100%%)';}
 window._gsDlClose=_dlClose;
-function _dlPush(items){
+window._gsDlToggle=function(){
+  _dlMountShelf();
+  if(_dlShelf.style.transform==='translateY(0)'){_dlClose();}
+  else{try{__ghostGetDownloads().then(function(j){_dlPush(JSON.parse(j));});}catch(_){_dlOpen();}}
+};
+window._dlPush=function _dlPush(items){
   _dlMountShelf();
   if(!items||!items.length){setTimeout(_dlClose,1500);return;}
-  // Re-render all rows after the header
   var hdr=document.getElementById('_gs_dl_hdr_row');
   while(_dlShelf.lastChild&&_dlShelf.lastChild!==hdr)_dlShelf.removeChild(_dlShelf.lastChild);
   var hasActive=false;
   items.forEach(function(it){
     if(it.State===0)hasActive=true;
-    var row=document.createElement('div');row.className='_gs_dl_row';
+    var row=document.createElement('div');
+    row.style.cssText='display:flex;flex-direction:column;gap:2px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.05)';
     var pct=it.TotalBytes>0?Math.round(it.RecvBytes/it.TotalBytes*100):0;
     var fname=it.Filename||(it.URL||'').split('/').pop()||'download';
     var st=it.State===0?(pct+'%%'):it.State===1?'Done':it.State===2?'Failed':'Cancelled';
     row.innerHTML=
-      '<div class="_gs_dl_hdr"><span class="_gs_dl_nm">'+fname+'</span>'+
-      '<span class="_gs_dl_stat">'+st+'</span></div>'+
+      '<div style="display:flex;align-items:center;gap:6px">'+
+      '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">'+fname+'</span>'+
+      '<span style="font-size:11px;color:rgba(255,255,255,.45);flex-shrink:0">'+st+'</span></div>'+
       (it.State===0?
-        '<div class="_gs_dl_trk"><div class="_gs_dl_fill" style="width:'+pct+'%%"></div></div>':
+        '<div style="height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden;margin-top:3px">'+
+        '<div style="height:100%%;background:linear-gradient(90deg,#7B61FF,#B89CFF);width:'+pct+'%%"></div></div>':
         '');
     _dlShelf.appendChild(row);
   });
   _dlOpen();
   if(!hasActive){setTimeout(_dlClose,4000);}
-}
-_dlBtn.addEventListener('click',function(){
-  if(_dlShelf.style.transform==='translateY(0)'){_dlClose();}
-  else{
-    try{__ghostGetDownloads().then(function(j){_dlPush(JSON.parse(j));});}
-    catch(_){_dlOpen();}
-  }
-});
+};
 
-/* ── Tab drag-and-drop ───────────────────────────────────────── */
-var _dg={on:false,el:null,ghost:null,fi:0,ti:0,moved:false,startX:0,pid:0};
-_tablist.addEventListener('pointerdown',function(e){
-  if(e.button!==0)return;
-  var el=e.target.closest('._gst');
-  if(!el||e.target.closest('._gst_x'))return;
-  var kids=Array.from(_tablist.children);
-  var fi=kids.indexOf(el);if(fi<0)return;
-  _dg.on=true;_dg.el=el;_dg.fi=fi;_dg.ti=fi;_dg.moved=false;
-  _dg.ghost=null;_dg.startX=e.clientX;_dg.pid=e.pointerId;
-},true);
-_tablist.addEventListener('pointermove',function(e){
-  if(!_dg.on||!_dg.el)return;
-  if(!_dg.moved&&Math.abs(e.clientX-_dg.startX)<5)return;
-  if(!_dg.moved){
-    _dg.moved=true;
-    _dg.el.setPointerCapture(_dg.pid);
-    var r=_dg.el.getBoundingClientRect();
-    var g=_dg.el.cloneNode(true);
-    g.style.cssText+='position:fixed;z-index:2147483648;opacity:.8;pointer-events:none;'+
-      'width:'+r.width+'px;left:'+(e.clientX-r.width/2)+'px;top:'+r.top+'px;margin:0;';
-    try{document.documentElement.appendChild(g);}catch(_){}
-    _dg.ghost=g;_dg.el.style.opacity='0.3';
-  }
-  if(_dg.ghost)_dg.ghost.style.left=(e.clientX-_dg.ghost.offsetWidth/2)+'px';
-  var kids=Array.from(_tablist.children);
-  for(var i=0;i<kids.length;i++){
-    if(kids[i]===_dg.el)continue;
-    var r2=kids[i].getBoundingClientRect();
-    if(e.clientX>=r2.left&&e.clientX<r2.right&&i!==_dg.ti){
-      if(i<_dg.ti){_tablist.insertBefore(_dg.el,kids[i]);}
-      else{_tablist.insertBefore(_dg.el,kids[i].nextSibling||null);}
-      _dg.ti=i;break;
-    }
-  }
-},true);
-function _dgEnd(){
-  if(!_dg.on)return;
-  var moved=_dg.moved,fi=_dg.fi,ti=_dg.ti;
-  _dg.on=false;_dg.moved=false;
-  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
-  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
-  if(moved&&fi!==ti){
-    var t=_T.tabs.splice(fi,1)[0];
-    _T.tabs.splice(ti,0,t);
-    _render();_save();
-  }
-}
-_tablist.addEventListener('pointerup',_dgEnd,true);
-_tablist.addEventListener('pointercancel',function(){
-  if(!_dg.on)return;
-  _dg.on=false;_dg.moved=false;
-  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
-  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
-},true);
-
-/* ── Title watcher ──────────────────────────────────────────── */
-var _titleWatched=false;
-function _watchTitle(){
-  if(_titleWatched)return;_titleWatched=true;
-  var t=document.querySelector('title');
-  if(t){new MutationObserver(function(){
-    // Only update the tab title — never the URL.
-    // Calling _updateCur() here would corrupt the target tab's URL when
-    // _T.current was already switched but the old page's title fires late.
-    var ti=document.title||location.hostname||'New Tab';
-    for(var i=0;i<_T.tabs.length;i++){
-      if(_T.tabs[i].id===_T.current){_T.tabs[i].title=ti;break;}
-    }
-    _render();
-  }).observe(t,{childList:true,characterData:true,subtree:true});}
-}
-
-/* ── Find bar (created lazily on first Ctrl+F) ──────────────── */
+/* в”Ђв”Ђ Find bar в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
 var _fb=null;
 function _ensureFb(){
   if(_fb&&document.getElementById('_gs_find'))return;
-  _fb=document.createElement('div');
-  _fb.id='_gs_find';
+  _fb=document.createElement('div');_fb.id='_gs_find';
   _fb.style.cssText=
     'position:fixed;bottom:0;right:0;z-index:2147483646;'+
     'background:rgba(20,20,50,.95);border:1px solid rgba(255,255,255,.15);'+
-    'border-radius:8px 8px 0 0;padding:8px 10px;'+
-    'gap:6px;align-items:center;box-shadow:0 -2px 12px rgba(0,0,0,.5)';
+    'border-radius:8px 8px 0 0;padding:8px 10px;gap:6px;align-items:center;'+
+    'box-shadow:0 -2px 12px rgba(0,0,0,.5);font-family:Segoe UI,system-ui,sans-serif';
   _fb.style.display='none';
-  var btnCss='background:transparent;border:1px solid rgba(255,255,255,.2);'+
-    'color:rgba(255,255,255,.8);font-size:12px;padding:4px 8px;border-radius:4px;cursor:pointer';
+  var btnCss='background:transparent;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.8);font-size:12px;padding:4px 8px;border-radius:4px;cursor:pointer';
   _fb.innerHTML=
-    '<input id="_gs_fi" autocomplete="off" placeholder="Find…" '+
-    'style="border:1px solid rgba(255,255,255,.2);border-radius:6px;'+
-    'background:rgba(255,255,255,.08);color:#fff;font-size:13px;'+
-    'padding:4px 10px;outline:none;width:200px">'+
-    '<button id="_gs_fp" title="Previous" style="'+btnCss+'">↑</button>'+
-    '<button id="_gs_fn" title="Next" style="'+btnCss+'">↓</button>'+
-    '<button id="_gs_fx" title="Close" style="'+btnCss+'">✕</button>';
+    '<input id="_gs_fi" autocomplete="off" placeholder="FindвЂ¦" '+
+    'style="border:1px solid rgba(255,255,255,.2);border-radius:6px;background:rgba(255,255,255,.08);color:#fff;font-size:13px;padding:4px 10px;outline:none;width:200px">'+
+    '<button id="_gs_fp" title="Previous" style="'+btnCss+'">&#8593;</button>'+
+    '<button id="_gs_fn" title="Next" style="'+btnCss+'">&#8595;</button>'+
+    '<button id="_gs_fx" title="Close" style="'+btnCss+'">&#10005;</button>';
   try{document.documentElement.appendChild(_fb);}catch(_){_fb=null;return;}
   var _fi=document.getElementById('_gs_fi');
-  _fi.addEventListener('input',function(){
-    if(_fi.value)window.find(_fi.value,false,false,true,false,false,false);
-  });
+  _fi.addEventListener('input',function(){if(_fi.value)window.find(_fi.value,false,false,true,false,false,false);});
   _fi.addEventListener('keydown',function(e){
     if(e.key==='Enter'){e.preventDefault();window.find(_fi.value,false,e.shiftKey,true,false,false,false);}
     if(e.key==='Escape'){_fb.style.display='none';}
   });
-  document.getElementById('_gs_fp').addEventListener('click',function(){
-    var fi=document.getElementById('_gs_fi');
-    if(fi)window.find(fi.value,false,true,true,false,false,false);
-  });
-  document.getElementById('_gs_fn').addEventListener('click',function(){
-    var fi=document.getElementById('_gs_fi');
-    if(fi)window.find(fi.value,false,false,true,false,false,false);
-  });
+  document.getElementById('_gs_fp').addEventListener('click',function(){var fi=document.getElementById('_gs_fi');if(fi)window.find(fi.value,false,true,true,false,false,false);});
+  document.getElementById('_gs_fn').addEventListener('click',function(){var fi=document.getElementById('_gs_fi');if(fi)window.find(fi.value,false,false,true,false,false,false);});
   document.getElementById('_gs_fx').addEventListener('click',function(){_fb.style.display='none';});
 }
-function _openFind(){
-  _ensureFb();
-  if(!_fb)return;
-  _fb.style.display='flex';
-  setTimeout(function(){var fi=document.getElementById('_gs_fi');if(fi){fi.focus();fi.select();}},50);
-}
-window._gsOpenFind=_openFind;
+window._gsOpenFind=function(){_ensureFb();if(!_fb)return;_fb.style.display='flex';setTimeout(function(){var fi=document.getElementById('_gs_fi');if(fi){fi.focus();fi.select();}},50);};
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(_fb)_fb.style.display='none';}},true);
 
-/* ── Context menu ───────────────────────────────────────────── */
+/* в”Ђв”Ђ Context menu в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
 var _cm=null;
 function _ensureCm(){
   if(_cm&&document.getElementById('_gs_ctx'))return;
-  _cm=document.createElement('div');
-  _cm.id='_gs_ctx';
+  _cm=document.createElement('div');_cm.id='_gs_ctx';
   _cm.style.cssText=
-    'position:fixed;z-index:2147483646;'+
-    'background:rgba(20,20,50,.97);border:1px solid rgba(255,255,255,.12);'+
-    'border-radius:8px;padding:4px;min-width:160px;'+
+    'position:fixed;z-index:2147483646;background:rgba(20,20,50,.97);'+
+    'border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:4px;min-width:160px;'+
     'box-shadow:0 4px 20px rgba(0,0,0,.6);font-family:Segoe UI,system-ui,sans-serif';
   _cm.style.display='none';
   try{document.documentElement.appendChild(_cm);}catch(_){_cm=null;}
@@ -1160,16 +860,11 @@ function _ctxItem(label,fn){
   return d;
 }
 function _ctxSep(){
-  var d=document.createElement('div');
-  d.style.cssText='height:1px;background:rgba(255,255,255,.1);margin:3px 6px';
-  return d;
+  var d=document.createElement('div');d.style.cssText='height:1px;background:rgba(255,255,255,.1);margin:3px 6px';return d;
 }
 function _showCtx(e){
-  _ensureCm();if(!_cm)return;
-  _cm.innerHTML='';
-  var tgt=e.target;
-  var link=tgt.closest('a[href]');
-  var img=tgt.closest('img');
+  _ensureCm();if(!_cm)return;_cm.innerHTML='';
+  var link=e.target.closest('a[href]');var img=e.target.closest('img');
   var sel=window.getSelection?window.getSelection().toString().trim():'';
   _cm.appendChild(_ctxItem('Back',function(){history.back();}));
   _cm.appendChild(_ctxItem('Forward',function(){history.forward();}));
@@ -1177,61 +872,37 @@ function _showCtx(e){
   if(link||img||sel)_cm.appendChild(_ctxSep());
   if(link){
     (function(href){
-      _cm.appendChild(_ctxItem('Open in new tab',function(){
-        window._gsNewTab&&window._gsNewTab();
-        setTimeout(function(){location.href=href;},50);
-      }));
+      _cm.appendChild(_ctxItem('Open in new tab',function(){try{__ghostOpenInNewTab(href);}catch(_){}}));
       _cm.appendChild(_ctxItem('Copy link',function(){try{navigator.clipboard.writeText(href);}catch(_){}}));
     })(link.href);
   }
   if(img){
     (function(src){
-      _cm.appendChild(_ctxItem('Open image in new tab',function(){
-        window._gsNewTab&&window._gsNewTab();
-        setTimeout(function(){location.href=src;},50);
-      }));
+      _cm.appendChild(_ctxItem('Open image in new tab',function(){try{__ghostOpenInNewTab(src);}catch(_){}}));
       _cm.appendChild(_ctxItem('Copy image URL',function(){try{navigator.clipboard.writeText(src);}catch(_){}}));
     })(img.src);
   }
   if(sel){
-    var short=sel.length>30?sel.slice(0,30)+'…':sel;
-    (function(q){
-      _cm.appendChild(_ctxItem('Search “'+short+'”',function(){
-        location.href=_searchURL+encodeURIComponent(q);
-      }));
-    })(sel);
+    var short=sel.length>30?sel.slice(0,30)+'вЂ¦':sel;
+    (function(q){_cm.appendChild(_ctxItem('Search "'+short+'"',function(){location.href=_searchURL+encodeURIComponent(q);}));})(sel);
   }
+  _cm.appendChild(_ctxSep());
+  _cm.appendChild(_ctxItem('Developer Tools',function(){try{__ghostOpenDevTools();}catch(_){}}));
   var x=e.clientX,y=e.clientY;
   _cm.style.left=x+'px';_cm.style.top=y+'px';_cm.style.display='block';
   var rect=_cm.getBoundingClientRect();
   if(rect.right>window.innerWidth)_cm.style.left=(x-rect.width)+'px';
   if(rect.bottom>window.innerHeight)_cm.style.top=(y-rect.height)+'px';
 }
-document.addEventListener('contextmenu',function(e){
-  e.preventDefault();
-  if(e.target.closest('#_gs_toolbar'))return;
-  _showCtx(e);
-},true);
-document.addEventListener('click',function(e){
-  if(_cm&&!_cm.contains(e.target))_cm.style.display='none';
-},true);
-document.addEventListener('keydown',function(e){
-  if(e.key==='Escape'){
-    if(_cm)_cm.style.display='none';
-    if(_fb)_fb.style.display='none';
-  }
-},true);
+document.addEventListener('contextmenu',function(e){e.preventDefault();_showCtx(e);},true);
+document.addEventListener('click',function(e){if(_cm&&!_cm.contains(e.target))_cm.style.display='none';},true);
 
-/* ── New-window intercept ────────────────────────────────────── */
-// WebView2 spawns a raw OS window for window.open() and target=_blank when
-// NewWindowRequested has no handler. We override both at the JS layer so
-// those navigations stay in the current tab instead.
+/* в”Ђв”Ђ New-window / target=_blank intercepts в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
 (function(){
   var _wo=window.open;
   window.open=function(url,name,feat){
     if(url&&typeof url==='string'&&!url.startsWith('javascript:')){
-      _ghostGoTo(url);
-      return window;
+      try{__ghostOpenInNewTab(url);}catch(_){}return window;
     }
     return _wo?_wo.apply(this,arguments):null;
   };
@@ -1243,10 +914,10 @@ document.addEventListener('click',function(e){
   if(t!=='_blank'&&t!=='_new'&&t!=='blank')return;
   try{if(new URL(a.href).pathname===location.pathname&&a.href.includes('#'))return;}catch(_){}
   e.preventDefault();e.stopPropagation();
-  _ghostGoTo(a.href);
+  try{__ghostOpenInNewTab(a.href);}catch(_){}
 },true);
 
-/* ── Download click intercept ───────────────────────────────── */
+/* в”Ђв”Ђ Download click intercept в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
 document.addEventListener('click',function(e){
   var a=e.target.closest('a[download]');
   if(!a||!a.href)return;
@@ -1254,64 +925,14 @@ document.addEventListener('click',function(e){
   try{__ghostDownloadStarted(a.href,fname,0);}catch(_){}
 },true);
 
-/* ── Mount: DOM insertion + one-time state init ─────────────── */
-var _ready=false;
-function mount(){
-  if(!document.documentElement)return;
-  if(!document.getElementById('_gs_st')){
-    try{if(document.head)document.head.appendChild(s);}catch(_){}
-  }
-  bar.style.setProperty('position','fixed','important');
-  bar.style.setProperty('top','0','important');
-  bar.style.setProperty('left','0','important');
-  bar.style.setProperty('right','0','important');
-  bar.style.setProperty('height',H+'px','important');
-  bar.style.setProperty('z-index','2147483647','important');
-  bar.style.setProperty('display','flex','important');
-  bar.style.setProperty('flex-direction','column','important');
-  try{
-    if(document.body)document.body.style.setProperty('padding-top',(H+(_bmBarOn?_HBM:0))+'px','important');
-  }catch(_){}
-  if(!document.getElementById('_gs_toolbar')){
-    try{document.documentElement.appendChild(bar);}catch(_){return;}
-    _addr.value=_url();
-    if(!_ready){
-      _ready=true;
-      if(_tabTitle)_tabTitle.textContent=document.title||location.hostname||_url();
-      _load(function(){_updateCur();_render();_save();});
-      _watchTitle();
-    }else{
-      _render();
-    }
-  }
-  // Bookmark bar: mount once, then let _bmBarUpdate control visibility
-  if(!document.getElementById('_gs_bm_bar')){
-    try{document.documentElement.appendChild(_bmBar);}catch(_){}
-    _bmBarUpdate();
-  }
-}
-
+/* в”Ђв”Ђ Record history on page load в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
 window.addEventListener('load',function(){
-  mount();
-  _addr.value=_url();
-  _load(function(){_updateCur();_render();_save();});
   try{
-    var u=_url();
-    if(u&&!u.startsWith('data:')&&!u.startsWith('about:'))
-      __ghostRecordHistory(u,document.title||'');
+    var u=window.location.href;
+    if(u&&!u.startsWith('data:')&&!u.startsWith('about:'))__ghostRecordHistory(u,document.title||'');
   }catch(_){}
-  _bmUpdate();
-  _badgeUpdate();
-  _bmBarUpdate();
 });
-window.addEventListener('popstate',function(){_addr.value=_url();_updateCur();_save();});
-
-if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',mount);}
-else{mount();}
-
-// Only re-mount if the toolbar was removed by the page; never re-render on a timer.
-setInterval(function(){if(!document.getElementById('_gs_toolbar'))mount();},500);
-})();`, profileName, p.searchEngineURL)
+})();`, p.searchEngineURL)
 
 	p.wv.Init(script)
 }
@@ -1353,28 +974,17 @@ window.addEventListener('keydown',function(e){
   if(!e.ctrlKey)return;
   switch(e.key){
     case 't':case 'T':
-      e.preventDefault();
-      if(typeof _gsNewTab==='function'){_gsNewTab();}else{location.href='ghost://newtab';}
-      break;
+      e.preventDefault();try{__ghostNewTab();}catch(_){}break;
     case 'w':case 'W':
-      e.preventDefault();
-      if(typeof _gsCloseCurrentTab==='function'){_gsCloseCurrentTab();}else{try{__ghostClose();}catch(_){}}
-      break;
+      e.preventDefault();try{__ghostCloseTab();}catch(_){}break;
     case 'l':case 'L':
-      e.preventDefault();
-      var a=document.getElementById('_gs_addr');
-      if(a){a.focus();a.select();}
-      break;
+      e.preventDefault();try{__ghostFocusAddr();}catch(_){}break;
     case 'r':case 'R':
       e.preventDefault();location.reload();break;
     case 'd':case 'D':
-      e.preventDefault();
-      if(typeof window._gsBmToggle==='function')window._gsBmToggle();
-      break;
+      e.preventDefault();try{__ghostToggleBm();}catch(_){}break;
     case 'f':case 'F':
-      e.preventDefault();
-      if(typeof window._gsOpenFind==='function')window._gsOpenFind();
-      break;
+      e.preventDefault();if(typeof window._gsOpenFind==='function')window._gsOpenFind();break;
   }
 });
 })();`)
@@ -1500,7 +1110,7 @@ func ghostPageBase(page, extraCSS, bodyContent string) string {
 <script>window.__ghostPageURL='ghost://` + page + `';</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:linear-gradient(160deg,#1a0a0a 0%,#0d0d30 50%,#050a28 100%);color:#E8E8F4;min-height:100vh;padding-top:90px}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:linear-gradient(160deg,#1a0a0a 0%,#0d0d30 50%,#050a28 100%);color:#E8E8F4;min-height:100vh}
 .page{max-width:800px;margin:0 auto;padding:24px}
 h1{font-size:1.8rem;font-weight:700;background:linear-gradient(90deg,#F4A460,#A080FF);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}
 ` + extraCSS + `
@@ -1540,7 +1150,7 @@ function render(){
     var info=document.createElement('div');info.className='bm-info';
     info.innerHTML='<div class="bm-title">'+esc(b.title||b.url)+'</div><div class="bm-url">'+esc(b.url)+'</div>';
     info.onclick=function(){location.href=b.url;};
-    var del=document.createElement('button');del.className='bm-del';del.textContent='✕';del.title='Remove';
+    var del=document.createElement('button');del.className='bm-del';del.textContent='вњ•';del.title='Remove';
     del.onclick=function(){__ghostRemoveBookmark(b.url).then(refresh);};
     d.appendChild(info);d.appendChild(del);l.appendChild(d);
   });
@@ -1591,7 +1201,7 @@ function render(){
     var d=document.createElement('div');d.className='he';
     var info=document.createElement('div');info.className='he-info';
     info.innerHTML='<div class="he-title">'+esc(e.title||e.url)+'</div><div class="he-url">'+esc(e.url)+'</div>';
-    var del=document.createElement('button');del.className='he-del';del.textContent='✕';del.title='Remove';
+    var del=document.createElement('button');del.className='he-del';del.textContent='вњ•';del.title='Remove';
     d.innerHTML='<span class="he-time">'+esc(fmt(e.visited_at))+'</span>';
     d.appendChild(info);d.appendChild(del);
     (function(entry,row,btn){
@@ -1625,7 +1235,7 @@ func (p *WebViewPanel) ghostDownloadsPage() string {
 	body := `<h1>Downloads</h1>
 <div id="list"></div>
 <script>
-var states={0:'Downloading…',1:'Complete',2:'Failed',3:'Cancelled'};
+var states={0:'DownloadingвЂ¦',1:'Complete',2:'Failed',3:'Cancelled'};
 function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function render(items){
   var l=document.getElementById('list');
@@ -1639,7 +1249,7 @@ function render(items){
       '<div class="dl-url">'+esc(it.URL||'')+'</div>'+
       '<div class="dl-bar"><div class="dl-fill" style="width:'+pct+'%"></div></div>'+
       '<div class="dl-foot"><span>'+esc(states[it.State]||'Unknown')+
-      (it.State===0&&it.TotalBytes>0?' — '+pct+'%':'')+
+      (it.State===0&&it.TotalBytes>0?' вЂ” '+pct+'%':'')+
       '</span>'+
       (it.State===1&&it.Destination?'<button class="open-btn" data-path="'+esc(it.Destination)+'">Open folder</button>':'')+
       '</div>';
@@ -1801,7 +1411,363 @@ load();
 	return ghostPageBase("settings", css, body)
 }
 
-// ── event bridge ─────────────────────────────────────────────────────────────
+// в”Ђв”Ђ event bridge в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+// ghostToolbarPage returns the standalone 82 px HTML page loaded into the
+// toolbar WebView2.  All chrome interactions use __tb* Go bindings.
+func (p *WebViewPanel) ghostToolbarPage() string {
+	searchURL := p.searchEngineURL
+	if searchURL == "" {
+		searchURL = "https://duckduckgo.com/?q="
+	}
+	searchJSON, _ := json.Marshal(searchURL)
+	return `<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<script>window.__tbSearchURL=` + string(searchJSON) + `;</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:82px;overflow:hidden;
+  background:linear-gradient(90deg,#3D1A0A 0%,#2A1560 40%,#0A1A6B 70%,#050E40 100%);
+  color:#E8E8F4;font-family:'Segoe UI',system-ui,sans-serif;user-select:none;-webkit-user-select:none}
+#tabs-row{height:38px;display:flex;align-items:flex-end;padding:0 0 0 8px;overflow:hidden}
+#tablist{display:flex;align-items:flex-end;gap:2px;overflow:hidden;flex:1;min-width:0}
+.tab{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.12);border-bottom:none;
+  border-radius:8px 8px 0 0;padding:0 4px 0 10px;height:30px;display:flex;align-items:center;
+  font-size:12px;color:rgba(255,255,255,.6);max-width:180px;min-width:80px;cursor:pointer;flex-shrink:0;
+  transition:background .18s,color .18s}
+.tab.active{background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.28)}
+.tab:hover:not(.active){background:rgba(255,255,255,.15);color:rgba(255,255,255,.9)}
+.tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.tab-fav{width:14px;height:14px;border-radius:2px;margin-right:4px;flex-shrink:0;object-fit:contain}
+.tab-x{background:transparent;border:none;color:rgba(255,255,255,.35);font-size:11px;
+  padding:0 3px;margin-left:2px;border-radius:3px;flex-shrink:0;cursor:pointer;line-height:1.5}
+.tab-x:hover{background:rgba(255,255,255,.18);color:#fff}
+#new-tab{background:transparent;border:none;color:rgba(255,255,255,.55);font-size:20px;
+  padding:0 8px;border-radius:50%;align-self:center;cursor:pointer;flex-shrink:0;line-height:1}
+#new-tab:hover{background:rgba(255,255,255,.14);color:#fff}
+#wm-btns{display:flex;align-items:stretch;height:38px;margin-left:auto}
+.wm-btn{background:transparent;border:none;width:46px;height:100%;
+  color:rgba(255,255,255,.8);font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:background .15s}
+.wm-btn:hover{background:rgba(255,255,255,.18)}
+#cls:hover{background:#E81123;color:#fff}
+#nav-row{height:44px;display:flex;align-items:center;padding:0 10px;gap:6px}
+.nav-btn{background:transparent;border:none;width:28px;height:28px;border-radius:50%;
+  font-size:16px;color:rgba(255,255,255,.7);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s}
+.nav-btn:hover{background:rgba(255,255,255,.14);color:#fff}
+#addr{flex:1;height:30px;border:1px solid rgba(255,255,255,.18);border-radius:15px;
+  padding:0 14px;font-size:13px;background:rgba(255,255,255,.10);color:#fff;outline:none;
+  transition:border-color .2s,background .2s}
+#addr::placeholder{color:rgba(255,255,255,.35)}
+#addr:focus{border-color:rgba(130,150,255,.75);background:rgba(255,255,255,.16)}
+#bm{background:transparent;border:none;width:28px;height:28px;border-radius:50%;
+  font-size:16px;color:rgba(255,255,255,.4);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s}
+#bm:hover{background:rgba(255,255,255,.13);color:#F4A460}
+#bm.bm-on{color:#F4A460}
+#badge{min-width:28px;height:22px;border-radius:11px;background:rgba(244,164,96,.10);
+  border:1px solid rgba(244,164,96,.22);color:rgba(244,164,96,.65);font-size:11px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;padding:0 5px;cursor:pointer;
+  flex-shrink:0;user-select:none;transition:background .15s,color .15s}
+#badge:hover{background:rgba(244,164,96,.2);color:#F4A460}
+#dl-btn{background:transparent;border:none;width:28px;height:28px;border-radius:50%;
+  font-size:14px;color:rgba(255,255,255,.6);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,color .15s}
+#dl-btn:hover{background:rgba(255,255,255,.14);color:#fff}
+</style>
+</head>
+<body>
+<div id="tabs-row">
+  <div id="tablist"></div>
+  <button id="new-tab" title="New Tab (Ctrl+T)">+</button>
+  <div id="wm-btns">
+    <button class="wm-btn" id="min" title="Minimise">&#8212;</button>
+    <button class="wm-btn" id="max" title="Maximise/Restore">&#9633;</button>
+    <button class="wm-btn" id="cls" title="Close">&#10005;</button>
+  </div>
+</div>
+<div id="nav-row">
+  <button class="nav-btn" id="back" title="Back">&#8592;</button>
+  <button class="nav-btn" id="fwd" title="Forward">&#8594;</button>
+  <button class="nav-btn" id="reload" title="Reload">&#8635;</button>
+  <input id="addr" type="text" spellcheck="false" placeholder="Search or enter address"/>
+  <button id="bm" title="Bookmark">&#9734;</button>
+  <div id="badge" title="Blocked trackers">0</div>
+  <button id="dl-btn" title="Downloads">&#8595;</button>
+</div>
+<script>
+(function(){
+'use strict';
+var _S=window.__tbSearchURL||'https://duckduckgo.com/?q=';
+var _T={tabs:[],current:0};
+var _loaded=false,_loadQ=[];
+var _curURL='';
+var _tablist=document.getElementById('tablist');
+
+/* ── Load tab state ─────────────────────────────────────────── */
+function _load(cb){
+  if(_loaded){if(cb)cb();return;}
+  if(cb)_loadQ.push(cb);
+  if(_loadQ.length>1)return;
+  if(window.__tbInitTabs&&window.__tbInitTabs.tabs&&window.__tbInitTabs.tabs.length){
+    _T=window.__tbInitTabs;_loaded=true;
+    var q=_loadQ.splice(0);q.forEach(function(f){try{f();}catch(_){}});return;
+  }
+  window.__tbTabsCb=function(obj){
+    _T=(obj&&obj.tabs&&obj.tabs.length)?obj:{tabs:[{id:1,url:'ghost://newtab',title:'New Tab'}],current:1};
+    _loaded=true;var q=_loadQ.splice(0);q.forEach(function(f){try{f();}catch(_){}});
+  };
+  try{__tbGetTabs();}catch(e){
+    window.__tbTabsCb=null;
+    _T={tabs:[{id:1,url:'ghost://newtab',title:'New Tab'}],current:1};
+    _loaded=true;var q=_loadQ.splice(0);q.forEach(function(f){try{f();}catch(_){}});
+  }
+}
+function _save(){try{__tbSetTabs(JSON.stringify(_T));}catch(_){}}
+
+/* ── Render tabs ────────────────────────────────────────────── */
+function _render(){
+  if(!_T.tabs||!_T.tabs.length)return;
+  var kids=_tablist.children;
+  if(kids.length===_T.tabs.length){
+    for(var i=0;i<_T.tabs.length;i++){
+      var t=_T.tabs[i];var el=kids[i];
+      var wantCls=t.id===_T.current?'tab active':'tab';
+      if(el.className!==wantCls)el.className=wantCls;
+      var sp=el.querySelector('span');var ttl=t.title||'New Tab';
+      if(sp&&sp.textContent!==ttl){sp.textContent=ttl;sp.title=ttl;}
+      var fav=el.querySelector('.tab-fav');
+      if(fav){
+        var http=t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'));
+        if(http){try{var h=new URL(t.url).hostname;
+          if(fav.getAttribute('data-h')!==h){fav.setAttribute('data-h',h);
+            fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
+            fav.style.display='';fav.onerror=function(){this.style.display='none';};}}
+          catch(_){fav.style.display='none';}}
+        else{fav.style.display='none';}
+      }
+    }
+    return;
+  }
+  _tablist.innerHTML='';
+  _T.tabs.forEach(function(t){
+    var el=document.createElement('div');
+    el.className=t.id===_T.current?'tab active':'tab';
+    var fav=document.createElement('img');fav.className='tab-fav';
+    if(t.url&&(t.url.startsWith('http://')||t.url.startsWith('https://'))){
+      try{var h=new URL(t.url).hostname;
+        fav.src='https://www.google.com/s2/favicons?domain='+h+'&sz=16';
+        fav.setAttribute('data-h',h);fav.onerror=function(){fav.style.display='none';};
+      }catch(_){fav.style.display='none';}
+    }else{fav.style.display='none';}
+    var sp=document.createElement('span');sp.textContent=t.title||'New Tab';sp.title=t.title||'';
+    var xb=document.createElement('button');xb.className='tab-x';xb.innerHTML='&#10005;';xb.title='Close';
+    el.appendChild(fav);el.appendChild(sp);el.appendChild(xb);
+    (function(id){
+      el.addEventListener('click',function(e){if(xb.contains(e.target))return;_switchTab(id);});
+      xb.addEventListener('click',function(e){e.stopPropagation();_closeTab(id);});
+    })(t.id);
+    _tablist.appendChild(el);
+  });
+}
+
+/* ── Navigation ─────────────────────────────────────────────── */
+function _updateCurURL(){
+  if(!_curURL)return;
+  for(var i=0;i<_T.tabs.length;i++){
+    if(_T.tabs[i].id===_T.current){_T.tabs[i].url=_curURL;break;}
+  }
+}
+function _goTo(url){
+  try{__tbGoTo(url,JSON.stringify(_T));}catch(e){console.error('[tb] __tbGoTo:',e);}
+}
+function _switchTab(id){
+  _updateCurURL();_T.current=id;_save();_render();
+  for(var i=0;i<_T.tabs.length;i++){
+    if(_T.tabs[i].id===id){var u=_T.tabs[i].url||'ghost://newtab';if(u!==_curURL)_goTo(u);return;}
+  }
+}
+
+/* ── Tab operations (called from content WebView2 via Go bindings) ── */
+window._gsNewTab=function(){
+  _load(function(){
+    _updateCurURL();
+    var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
+    var id=mx+1;_T.tabs.push({id:id,url:'ghost://newtab',title:'New Tab'});
+    _T.current=id;_save();_render();_goTo('ghost://newtab');
+  });
+};
+window._gsCloseCurrentTab=function(){_closeTab(_T.current);};
+window._gsOpenInNewTab=function(url){
+  if(!url||url.startsWith('javascript:'))return;
+  _load(function(){
+    _updateCurURL();
+    var mx=0;_T.tabs.forEach(function(t){if(t.id>mx)mx=t.id;});
+    var id=mx+1;_T.tabs.push({id:id,url:url,title:'New Tab'});
+    _T.current=id;_save();_render();_goTo(url);
+  });
+};
+function _closeTab(id){
+  if(_T.tabs.length<=1){try{__tbClose();}catch(_){}return;}
+  var idx=-1;for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===id){idx=i;break;}}
+  if(idx<0)return;
+  var wa=id===_T.current;
+  _T.tabs.splice(idx,1);
+  if(wa){var ni=Math.min(idx,_T.tabs.length-1);_T.current=_T.tabs[ni].id;_save();_render();
+    _goTo(_T.tabs[ni].url||'ghost://newtab');}
+  else{_save();_render();}
+}
+
+/* ── Address bar ────────────────────────────────────────────── */
+var _addr=document.getElementById('addr');
+_addr.addEventListener('keydown',function(e){
+  if(e.key!=='Enter')return;e.preventDefault();
+  var r=_addr.value.trim();if(!r)return;
+  var u=r;
+  if(!u.match(/^https?:\/\//i)&&!u.startsWith('ghost://')){
+    if(u.indexOf('.')>=0&&u.indexOf(' ')<0){u='https://'+u;}
+    else{u=_S+encodeURIComponent(u);}
+  }
+  _load(function(){
+    _updateCurURL();
+    for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===_T.current){_T.tabs[i].url=u;break;}}
+    _save();_goTo(u);
+  });
+});
+_addr.addEventListener('focus',function(){_addr.select();});
+
+/* ── Callbacks from Go ──────────────────────────────────────── */
+window._tbNavUpdate=function(url){
+  _curURL=url;_addr.value=url;
+  for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===_T.current){_T.tabs[i].url=url;break;}}
+  _save();_bmUpdate();_badgeUpdate();
+};
+window._tbTitleUpdate=function(title){
+  for(var i=0;i<_T.tabs.length;i++){if(_T.tabs[i].id===_T.current){_T.tabs[i].title=title||'New Tab';break;}}
+  _render();
+};
+
+/* ── Window controls ────────────────────────────────────────── */
+function _updateMaxBtn(){
+  var b=document.getElementById('max');if(!b)return;
+  try{__tbIsMaximized().then(function(m){b.innerHTML=m?'&#10064;':'&#9633;';b.title=m?'Restore':'Maximise';});}catch(_){}
+}
+_updateMaxBtn();window.addEventListener('resize',_updateMaxBtn);
+document.getElementById('tabs-row').addEventListener('mousedown',function(e){
+  if(e.button===0&&!e.target.closest('button,.tab')){try{__tbStartDrag();}catch(_){}}
+});
+document.getElementById('min').addEventListener('click',function(){try{__tbMinimize();}catch(_){}});
+document.getElementById('max').addEventListener('click',function(){_updateMaxBtn();try{__tbMaximize();}catch(_){}});
+document.getElementById('cls').addEventListener('click',function(){try{__tbClose();}catch(_){}});
+document.getElementById('new-tab').addEventListener('click',function(){window._gsNewTab();});
+document.getElementById('back').addEventListener('click',function(){try{__tbBack();}catch(_){}});
+document.getElementById('fwd').addEventListener('click',function(){try{__tbFwd();}catch(_){}});
+document.getElementById('reload').addEventListener('click',function(){try{__tbReload();}catch(_){}});
+document.getElementById('dl-btn').addEventListener('click',function(){try{__tbToggleDownloads();}catch(_){}});
+document.getElementById('badge').addEventListener('click',function(){_goTo('ghost://privacy');});
+
+/* ── Bookmarks ──────────────────────────────────────────────── */
+var _bmEl=document.getElementById('bm');
+function _bmUpdate(){
+  var u=_curURL;
+  if(!u||u.startsWith('ghost://')||u.startsWith('data:')){
+    _bmEl.textContent='☆';_bmEl.classList.remove('bm-on');
+    _bmEl.style.opacity='0.25';_bmEl.title='Cannot bookmark internal pages';return;
+  }
+  _bmEl.style.opacity='';_bmEl.title='Bookmark (Ctrl+D)';
+  try{__tbIsBookmarked(u).then(function(yes){
+    _bmEl.textContent=yes?'★':'☆';
+    if(yes)_bmEl.classList.add('bm-on');else _bmEl.classList.remove('bm-on');
+  });}catch(_){}
+}
+window._bmToggle=function(){
+  var u=_curURL;
+  if(!u||u.startsWith('ghost://')||u.startsWith('data:'))return;
+  if(_bmEl.classList.contains('bm-on')){
+    _bmEl.textContent='☆';_bmEl.classList.remove('bm-on');
+    try{__tbRemoveBookmark(u);}catch(_){}
+  }else{
+    _bmEl.textContent='★';_bmEl.classList.add('bm-on');
+    try{__tbAddBookmark(u,u);}catch(_){}
+  }
+};
+_bmEl.addEventListener('click',window._bmToggle);
+
+/* ── Blocked count badge ────────────────────────────────────── */
+var _badgeEl=document.getElementById('badge');
+function _badgeUpdate(){
+  try{__tbGetBlockedCount().then(function(n){
+    _badgeEl.textContent=n||0;_badgeEl.title='Blocked trackers: '+(n||0);
+  });}catch(_){}
+}
+setInterval(_badgeUpdate,2000);
+
+/* ── Top-edge resize detection ──────────────────────────────── */
+document.addEventListener('mousemove',function(e){
+  if(e.clientY<8){var x=e.clientX,w=window.innerWidth;
+    document.documentElement.style.cursor=x<8?'nw-resize':x>=w-8?'ne-resize':'n-resize';
+  }else{document.documentElement.style.cursor='';}
+},true);
+document.addEventListener('mousedown',function(e){
+  if(e.button!==0||e.target.closest('button,input')||e.clientY>=8)return;
+  e.preventDefault();e.stopPropagation();
+  var x=e.clientX,w=window.innerWidth;
+  try{__tbStartResize(x<8?13:x>=w-8?14:12);}catch(_){}
+},true);
+
+/* ── Tab drag-and-drop ───────────────────────────────────────── */
+var _dg={on:false,el:null,ghost:null,fi:0,ti:0,moved:false,startX:0,pid:0};
+_tablist.addEventListener('pointerdown',function(e){
+  if(e.button!==0)return;
+  var el=e.target.closest('.tab');if(!el||e.target.closest('.tab-x'))return;
+  var kids=Array.from(_tablist.children);var fi=kids.indexOf(el);if(fi<0)return;
+  _dg.on=true;_dg.el=el;_dg.fi=fi;_dg.ti=fi;_dg.moved=false;_dg.startX=e.clientX;_dg.pid=e.pointerId;
+},true);
+_tablist.addEventListener('pointermove',function(e){
+  if(!_dg.on||!_dg.el)return;
+  if(!_dg.moved&&Math.abs(e.clientX-_dg.startX)<5)return;
+  if(!_dg.moved){
+    _dg.moved=true;_dg.el.setPointerCapture(_dg.pid);
+    var r=_dg.el.getBoundingClientRect();
+    var g=_dg.el.cloneNode(true);
+    g.style.cssText+=';position:fixed;z-index:99;opacity:.8;pointer-events:none;'+
+      'width:'+r.width+'px;left:'+(e.clientX-r.width/2)+'px;top:'+r.top+'px;margin:0';
+    document.body.appendChild(g);_dg.ghost=g;_dg.el.style.opacity='0.3';
+  }
+  if(_dg.ghost)_dg.ghost.style.left=(e.clientX-_dg.ghost.offsetWidth/2)+'px';
+  var kids=Array.from(_tablist.children);
+  for(var i=0;i<kids.length;i++){
+    if(kids[i]===_dg.el)continue;
+    var r2=kids[i].getBoundingClientRect();
+    if(e.clientX>=r2.left&&e.clientX<r2.right&&i!==_dg.ti){
+      _tablist.insertBefore(_dg.el,i<_dg.ti?kids[i]:kids[i].nextSibling||null);_dg.ti=i;break;
+    }
+  }
+},true);
+function _dgEnd(){
+  if(!_dg.on)return;
+  var moved=_dg.moved,fi=_dg.fi,ti=_dg.ti;
+  _dg.on=false;_dg.moved=false;
+  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
+  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
+  if(moved&&fi!==ti){var t=_T.tabs.splice(fi,1)[0];_T.tabs.splice(ti,0,t);_render();_save();}
+}
+_tablist.addEventListener('pointerup',_dgEnd,true);
+_tablist.addEventListener('pointercancel',function(){
+  _dg.on=false;_dg.moved=false;
+  if(_dg.ghost){try{_dg.ghost.remove();}catch(_){}_dg.ghost=null;}
+  if(_dg.el){_dg.el.style.opacity='';_dg.el=null;}
+},true);
+
+/* ── Init ───────────────────────────────────────────────────── */
+_load(function(){_render();});
+try{__tbOnLoad();}catch(_){}
+})();
+</script>
+</body>
+</html>`
+}
 
 func (p *WebViewPanel) bindEventBridge() {
 	p.wv.Bind("__ghostOnNavStart", func(url string) {
@@ -1815,11 +1781,27 @@ func (p *WebViewPanel) bindEventBridge() {
 		}
 	})
 	p.wv.Bind("__ghostOnTitle", func(title string) {
+		if p.toolbarWv != nil {
+			titleJSON, _ := json.Marshal(title)
+			p.mainWindow.Synchronize(func() {
+				p.toolbarWv.Eval("if(typeof _tbTitleUpdate==='function')_tbTitleUpdate(" + string(titleJSON) + ")")
+			})
+		}
 		if p.OnTitleChange != nil {
 			p.OnTitleChange(title)
 		}
 	})
 	p.wv.Bind("__ghostOnURL", func(url string) {
+		// Skip data: URLs вЂ” the Navigate() method already pushed the ghost:// URL.
+		if !strings.HasPrefix(url, "data:") {
+			p.curURL = url
+			if p.toolbarWv != nil {
+				urlJSON, _ := json.Marshal(url)
+				p.mainWindow.Synchronize(func() {
+					p.toolbarWv.Eval("if(typeof _tbNavUpdate==='function')_tbNavUpdate(" + string(urlJSON) + ")")
+				})
+			}
+		}
 		if p.OnURLChange != nil {
 			p.OnURLChange(url)
 		}
@@ -1832,18 +1814,19 @@ func (p *WebViewPanel) bindEventBridge() {
 
 	p.wv.Init(`(function(){
 'use strict';
+function _pageURL(){return window.__ghostPageURL||window.location.href;}
 if(window.navigation){
   window.navigation.addEventListener('navigate',function(e){
     try{__ghostOnNavStart(e.destination.url)}catch(_){}
   });
   window.navigation.addEventListener('navigatesuccess',function(){
-    var u=window.location.href;
+    var u=_pageURL();
     try{__ghostOnNavDone(u)}catch(_){}
     try{__ghostOnURL(u)}catch(_){}
   });
 }
 window.addEventListener('load',function(){
-  var u=window.location.href;
+  var u=_pageURL();
   try{__ghostOnNavDone(u)}catch(_){}
   try{__ghostOnURL(u)}catch(_){}
 });
@@ -1863,16 +1846,16 @@ if(document.readyState==='loading'){
   var o=history[m];
   history[m]=function(){
     o.apply(this,arguments);
-    try{__ghostOnURL(window.location.href)}catch(_){}
+    try{__ghostOnURL(_pageURL())}catch(_){}
   };
 });
 window.addEventListener('popstate',function(){
-  try{__ghostOnURL(window.location.href)}catch(_){}
+  try{__ghostOnURL(_pageURL())}catch(_){}
 });
 })();`)
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 func extractBrowserName(ua string) string {
 	switch {
@@ -1887,7 +1870,7 @@ func extractBrowserName(ua string) string {
 	}
 }
 
-// ── polyfill ──────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ polyfill в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 type profileConfig struct {
 	UserAgent           string   `json:"userAgent"`
@@ -2005,11 +1988,12 @@ func min(a, b int) int {
 	return b
 }
 
-// ── frameless WndProc subclass ────────────────────────────────────────────────
+// в”Ђв”Ђ frameless WndProc subclass в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	const (
 		gwlpWndProc   = ^uintptr(3)
+		wmSize        = uintptr(0x0005)
 		wmNcCalcSize  = uintptr(0x0083)
 		wmNcHitTest   = uintptr(0x0084)
 		htClient      = uintptr(1)
@@ -2067,6 +2051,23 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 			default:
 				return htClient
 			}
+		case wmSize:
+			r, _, _ := callWndProc.Call(origProc, h, msg, wp, lp)
+			cw := int(lp & 0xFFFF)
+			ch := int((lp >> 16) & 0xFFFF)
+			// Resize toolbar HWND to match new window width.
+			if p.toolbarHWND != 0 {
+				win.MoveWindow(p.toolbarHWND, 0, 0, int32(cw), int32(toolbarH), true)
+				win.SetWindowPos(p.toolbarHWND, win.HWND_TOP, 0, 0, 0, 0,
+					win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
+			}
+			// Content WebView2 always starts below the toolbar.
+			if p.devToolsHWND != 0 && win.IsWindowVisible(p.devToolsHWND) {
+				p.adjustDevToolsSplit(cw, ch)
+			} else {
+				p.setWebViewBounds(0, toolbarH, cw, ch)
+			}
+			return r
 		}
 		r, _, _ := callWndProc.Call(origProc, h, msg, wp, lp)
 		return r
@@ -2076,7 +2077,7 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	setWndLongPtr.Call(uintptr(hwnd), gwlpWndProc, cb)
 }
 
-// ── resize ────────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ resize в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 func (p *WebViewPanel) onResize() {
 	if p.wv == nil || p.mainWindow == nil {
@@ -2091,7 +2092,179 @@ func (p *WebViewPanel) onResize() {
 
 func (p *WebViewPanel) ForceResize() { p.onResize() }
 
-// ── ghost:// scheme ───────────────────────────────────────────────────────────
+// в”Ђв”Ђ DevTools embedding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+// EmbedDevToolsToggle opens DevTools docked to the right of the page on the
+// first call, then toggles its visibility on subsequent calls.
+// Must be called on the UI thread.
+func (p *WebViewPanel) EmbedDevToolsToggle() {
+	if p.devToolsHWND != 0 {
+		var cr win.RECT
+		win.GetClientRect(p.wvHWND, &cr)
+		if win.IsWindowVisible(p.devToolsHWND) {
+			win.ShowWindow(p.devToolsHWND, win.SW_HIDE)
+			// Restore content WebView2 to fill below toolbar.
+			p.setWebViewBounds(0, toolbarH, int(cr.Right), int(cr.Bottom))
+		} else {
+			p.adjustDevToolsSplit(int(cr.Right), int(cr.Bottom))
+		}
+		return
+	}
+	if p.devToolsPending {
+		return
+	}
+	c := extractChromium(p.wv)
+	if c == nil {
+		return
+	}
+	// Snapshot existing top-level windows so we can identify the new DevTools one.
+	before := make(map[uintptr]bool)
+	user32 := syscall.NewLazyDLL("user32.dll")
+	enumWindows := user32.NewProc("EnumWindows")
+	snapCb := syscall.NewCallback(func(hwnd, _ uintptr) uintptr {
+		before[hwnd] = true
+		return 1
+	})
+	enumWindows.Call(snapCb, 0)
+	openDevToolsWindow(c)
+	p.devToolsPending = true
+	go p.awaitAndEmbedDevTools(before)
+}
+
+// awaitAndEmbedDevTools polls top-level windows until the DevTools window
+// appears, then reparents it into the browser window.
+func (p *WebViewPanel) awaitAndEmbedDevTools(before map[uintptr]bool) {
+	user32 := syscall.NewLazyDLL("user32.dll")
+	enumWindows := user32.NewProc("EnumWindows")
+	getWindowText := user32.NewProc("GetWindowTextW")
+
+	var foundHWND uintptr
+	searchCb := syscall.NewCallback(func(hwnd, _ uintptr) uintptr {
+		if before[hwnd] {
+			return 1
+		}
+		buf := make([]uint16, 256)
+		getWindowText.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
+		title := syscall.UTF16ToString(buf)
+		if strings.Contains(title, "DevTools") {
+			foundHWND = hwnd
+			return 0
+		}
+		return 1
+	})
+
+	var devHWND win.HWND
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		foundHWND = 0
+		enumWindows.Call(searchCb, 0)
+		if foundHWND != 0 {
+			devHWND = win.HWND(foundHWND)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	p.mainWindow.Synchronize(func() {
+		p.devToolsPending = false
+		if devHWND == 0 {
+			return
+		}
+		p.devToolsHWND = devHWND
+
+		// Convert from top-level to child window: add WS_CHILD, strip
+		// WS_POPUP/WS_CAPTION/WS_THICKFRAME/WS_SYSMENU so there is no title bar.
+		style := uint32(win.GetWindowLong(devHWND, win.GWL_STYLE))
+		style = (style &^ uint32(win.WS_POPUP) &^ uint32(win.WS_CAPTION) &
+			^uint32(win.WS_THICKFRAME) &^ uint32(win.WS_SYSMENU)) | uint32(win.WS_CHILD)
+		win.SetWindowLong(devHWND, win.GWL_STYLE, int32(style))
+
+		// Remove WS_EX_APPWINDOW so it no longer appears in the taskbar.
+		const wsExAppWindow = 0x00040000
+		exStyle := win.GetWindowLong(devHWND, win.GWL_EXSTYLE)
+		win.SetWindowLong(devHWND, win.GWL_EXSTYLE, exStyle&^int32(wsExAppWindow))
+
+		win.SetParent(devHWND, p.wvHWND)
+		win.SetWindowPos(devHWND, 0, 0, 0, 0, 0,
+			win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|
+				win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+
+		var r win.RECT
+		win.GetClientRect(p.wvHWND, &r)
+		p.adjustDevToolsSplit(int(r.Right), int(r.Bottom))
+	})
+}
+
+// adjustDevToolsSplit divides the browser window into a left content area
+// (WebView2) and a right DevTools panel, then shows DevTools.
+// Must be called after go-webview2's own WM_SIZE/Resize so our PutBounds
+// overrides the auto-fill that Resize performs.
+func (p *WebViewPanel) adjustDevToolsSplit(winW, winH int) {
+	if p.devToolsHWND == 0 {
+		return
+	}
+	dtW := winW * 2 / 5 // ~40% for DevTools, like Chrome's default
+	if dtW < 320 {
+		dtW = 320
+	}
+	if dtW > winW-200 {
+		dtW = winW - 200
+	}
+	wvW := winW - dtW
+	contentH := winH - toolbarH
+	p.setWebViewBounds(0, toolbarH, wvW, winH)
+	win.MoveWindow(p.devToolsHWND, int32(wvW), int32(toolbarH), int32(dtW), int32(contentH), true)
+	win.ShowWindow(p.devToolsHWND, win.SW_SHOW)
+	win.SetWindowPos(p.devToolsHWND, win.HWND_TOP, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
+}
+
+// setWebViewBounds calls ICoreWebView2Controller.PutBounds directly via vtable
+// so the WebView2 rendering surface occupies exactly the specified rect within
+// the parent window, rather than auto-filling the entire client area.
+//
+// PutBounds is vtable slot 6 in ICoreWebView2Controller (3 IUnknown +
+// GetIsVisible + PutIsVisible + GetBounds + PutBounds).
+func (p *WebViewPanel) setWebViewBounds(left, top, right, bottom int) {
+	ctrl := p.getWebViewController()
+	if ctrl == nil {
+		return
+	}
+	rect := win.RECT{
+		Left:   int32(left),
+		Top:    int32(top),
+		Right:  int32(right),
+		Bottom: int32(bottom),
+	}
+	const putBoundsVtblIdx = uintptr(6)
+	ctrlPtr := uintptr(unsafe.Pointer(ctrl))
+	vtbl := *(*uintptr)(unsafe.Pointer(ctrlPtr))
+	fn := *(*uintptr)(unsafe.Pointer(vtbl + putBoundsVtblIdx*8))
+	syscall.SyscallN(fn, ctrlPtr, uintptr(unsafe.Pointer(&rect)))
+}
+
+// getWebViewController extracts the *edge.ICoreWebView2Controller from the
+// unexported controller field of edge.Chromium using reflection.
+func (p *WebViewPanel) getWebViewController() *edge.ICoreWebView2Controller {
+	c := extractChromium(p.wv)
+	if c == nil {
+		return nil
+	}
+	t := reflect.TypeOf(*c)
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Name == "controller" {
+			off := t.Field(i).Offset
+			ptr := *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(c)) + off))
+			if ptr == 0 {
+				return nil
+			}
+			return (*edge.ICoreWebView2Controller)(unsafe.Pointer(ptr))
+		}
+	}
+	return nil
+}
+
+// в”Ђв”Ђ ghost:// scheme в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 func (p *WebViewPanel) handleGhostScheme(url string) string {
 	return fmt.Sprintf(`<p>ghost: %s</p>`, url)

@@ -41,6 +41,7 @@ import (
 	"ghost-silicon/internal/app/bootstrap"
 	"ghost-silicon/internal/app/lifecycle"
 	"ghost-silicon/internal/app/shutdown"
+	"ghost-silicon/internal/config/schema"
 	"ghost-silicon/internal/engine/adapter"
 	eruntime "ghost-silicon/internal/engine/runtime"
 	"ghost-silicon/internal/ipc/jsonrpc"
@@ -264,12 +265,15 @@ func run() error {
 	}
 
 	// ── GUI MODE ──────────────────────────────────────────────────────────
+	rotPolicy := rotationPolicy(cfg.Identity.Rotation)
 	win, err := browser.NewWindow(browser.WindowOptions{
 		Bridge:          br,
 		UserDataDir:     userDataDir,
 		PipeName:        cfg.IPC.PipeName,
 		SearchEngineURL: searchEngineURL,
 		Log:             log,
+		IdentityStore:   profileStore,
+		RotationPolicy:  rotPolicy,
 	})
 	if err != nil {
 		return fmt.Errorf("browser window create: %w", err)
@@ -372,6 +376,22 @@ func resolveProfile(
 		return p, nil
 	}
 	return nil, fmt.Errorf("no profiles found and auto_generate is disabled")
+}
+
+// rotationPolicy converts the YAML schema config to an identity.RotationPolicy.
+// Returns nil when the trigger is "never" or empty so that no rotation state
+// is created and no background goroutines are started.
+func rotationPolicy(rc schema.RotationConfig) *identity.RotationPolicy {
+	trigger := identity.RotationTrigger(rc.Trigger)
+	if trigger == "" || trigger == identity.RotationNever {
+		return nil
+	}
+	return &identity.RotationPolicy{
+		Trigger:        trigger,
+		Interval:       rc.Interval,
+		MaxRequests:    rc.MaxRequests,
+		TemplateSource: identity.TemplateName(rc.TemplateSource),
+	}
 }
 
 // newSessionID returns a cryptographically random 16-byte hex session ID.

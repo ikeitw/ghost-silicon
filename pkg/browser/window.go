@@ -19,6 +19,7 @@ import (
 
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
+	"ghost-silicon/pkg/identity"
 	"ghost-silicon/pkg/version"
 )
 
@@ -36,6 +37,8 @@ type WindowOptions struct {
 	PipeName        string
 	SearchEngineURL string
 	Log             *logging.Logger
+	IdentityStore   identity.Store           // nil = profile switching disabled
+	RotationPolicy  *identity.RotationPolicy // nil = no rotation
 }
 
 // Window is the top-level Ghost-Silicon browser window.
@@ -148,7 +151,7 @@ func (w *Window) Open() error {
 
 	// ── WebView panel (fills entire client area) ──────────────────────────
 	w.webview, err = NewWebViewPanel(mw, w.opts.Bridge, w.opts.UserDataDir, w.opts.SearchEngineURL, w.log,
-		w.bookmarks, w.browsingHist, w.dlMgr)
+		w.bookmarks, w.browsingHist, w.dlMgr, w.opts.IdentityStore, w.opts.RotationPolicy)
 	if err != nil {
 		return fmt.Errorf("webview panel: %w", err)
 	}

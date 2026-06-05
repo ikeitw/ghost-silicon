@@ -1,13 +1,13 @@
 //go:build windows
 
-// Package browser вЂ” WebView2 embed and browser chrome.
+// Package browser вЂ" WebView2 embed and browser chrome.
 //
 // Architecture (HTML chrome):
 //
 //	go-webview2 top-level window (frameless, subclassed WndProc)
-//	в””в”Ђв”Ђ WebView2 controller (fills entire client area)
-//	    в””в”Ђв”Ђ HTML chrome overlay (position:fixed, z-index max)
-//	        вЂ” address bar, nav buttons, tab strip вЂ” all rendered as HTML
+//	в""в"Ђв"Ђ WebView2 controller (fills entire client area)
+//	    в""в"Ђв"Ђ HTML chrome overlay (position:fixed, z-index max)
+//	        вЂ" address bar, nav buttons, tab strip вЂ" all rendered as HTML
 //
 // The browser chrome (toolbar, tabs, address bar) is implemented as a
 // position:fixed HTML overlay injected into every page via
@@ -37,6 +37,7 @@ import (
 
 	"ghost-silicon/internal/telemetry/logging"
 	"ghost-silicon/pkg/bridge"
+	"ghost-silicon/pkg/identity"
 )
 
 // wvBrowserSlot mirrors the first 4 words of go-webview2's unexported webview
@@ -51,7 +52,7 @@ type wvBrowserSlot struct {
 
 // extractChromium reads the *edge.Chromium that go-webview2 stores inside the
 // unexported webview.browser interface field.  Safe only for pinned go-webview2
-// commit dc24628cff85 вЂ” the struct layout is stable for that revision.
+// commit dc24628cff85 вЂ" the struct layout is stable for that revision.
 func extractChromium(wv webview2.WebView) *edge.Chromium {
 	slot := (*wvBrowserSlot)(unsafe.Pointer(reflect.ValueOf(wv).Pointer()))
 	if slot.data == 0 {
@@ -102,7 +103,7 @@ func openDevToolsWindow(c *edge.Chromium) {
 // Content WebView2 rendering always starts at y=toolbarH.
 const toolbarH = 82
 
-// в”Ђв”Ђ WebViewPanel в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ WebViewPanel в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 // WebViewPanel wraps a go-webview2 WebView that occupies the entire Walk
 // MainWindow client area.  The browser chrome (toolbar, tabs, address bar) is
@@ -128,10 +129,15 @@ type WebViewPanel struct {
 	searchEngineURL string  // URL prefix for address-bar text searches
 
 	// Feature stores wired to JS bindings.
-	bookmarks    *BookmarkStore
-	browsingHist *BrowsingHistoryStore
-	dlMgr        *DownloadManager
-	blocker      *Blocker
+	bookmarks     *BookmarkStore
+	browsingHist  *BrowsingHistoryStore
+	dlMgr         *DownloadManager
+	blocker       *Blocker
+	netLog        *NetworkLog
+	auditLog      *AuditLog
+	identityStore identity.Store
+	rotState      *identity.RotationState
+	rotPolicy     identity.RotationPolicy
 
 	// Callbacks set by Window after construction.
 	OnTitleChange  func(title string)
@@ -141,7 +147,7 @@ type WebViewPanel struct {
 	OnLoadError    func(url, errMsg string)
 }
 
-// в”Ђв”Ђ data types for JS bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ data types for JS bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 type privacyData struct {
 	ProfileName         string  `json:"profileName"`
@@ -195,9 +201,15 @@ func NewWebViewPanel(
 	bookmarks *BookmarkStore,
 	browsingHist *BrowsingHistoryStore,
 	dlMgr *DownloadManager,
+	identityStore identity.Store,
+	rotPolicy *identity.RotationPolicy,
 ) (*WebViewPanel, error) {
 	if searchEngineURL == "" {
 		searchEngineURL = "https://duckduckgo.com/?q="
+	}
+	var rp identity.RotationPolicy
+	if rotPolicy != nil {
+		rp = *rotPolicy
 	}
 	p := &WebViewPanel{
 		mainWindow:      mw,
@@ -209,7 +221,38 @@ func NewWebViewPanel(
 		browsingHist:    browsingHist,
 		dlMgr:           dlMgr,
 		blocker:         NewBlocker(),
+		netLog:          newNetworkLog(),
+		auditLog:        newAuditLog(),
+		identityStore:   identityStore,
+		rotPolicy:       rp,
 	}
+	// Set up rotation state if a non-never policy was given.
+	if rotPolicy != nil && rotPolicy.Trigger != identity.RotationNever {
+		if rs, err := identity.NewRotationState(br.Profile(), *rotPolicy); err == nil {
+			p.rotState = rs
+			if rotPolicy.Trigger == identity.RotationOnSession {
+				if newProf, rotated := rs.NotifyNewSession(); rotated {
+					br.UpdateProfile(newProf)
+					p.auditLog.record("rotation", "session rotation → "+newProf.Name)
+				}
+			} else if rotPolicy.Trigger == identity.RotationOnInterval {
+				go func() {
+					ticker := time.NewTicker(10 * time.Second)
+					defer ticker.Stop()
+					for range ticker.C {
+						if newProf, rotated := rs.CheckInterval(); rotated {
+							mw.Synchronize(func() {
+								br.UpdateProfile(newProf)
+								_ = p.injectPolyfill()
+								p.auditLog.record("rotation", "interval rotation → "+newProf.Name)
+							})
+						}
+					}
+				}()
+			}
+		}
+	}
+	p.auditLog.record("start", "browser started with profile "+br.Profile().Name)
 
 	hwnd := unsafe.Pointer(uintptr(mw.Handle()))
 	wv := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -224,28 +267,46 @@ func NewWebViewPanel(
 		},
 	})
 	if wv == nil {
-		return nil, fmt.Errorf("webview2: failed to create instance вЂ” " +
-			"ensure the WebView2 Runtime (Edge) is installed")
+		return nil, fmt.Errorf("webview2: failed to create instance - ensure the WebView2 Runtime (Edge) is installed")
 	}
 	p.wv = wv
 	p.log.Info("webview2 initialised")
 
-	// в”Ђв”Ђ Ad/tracker blocker в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Ad/tracker blocker в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Wire Blocker.ShouldBlock to WebResourceRequested so the badge counter
 	// reflects real blocked requests and resources are suppressed.
 	if c := extractChromium(p.wv); c != nil {
 		blocker := p.blocker
+		nl := p.netLog
+		al := p.auditLog
 		c.WebResourceRequestedCallback = func(
 			req *edge.ICoreWebView2WebResourceRequest,
 			args *edge.ICoreWebView2WebResourceRequestedEventArgs,
 		) {
 			uri, err := req.GetUri()
-			if err != nil || !blocker.ShouldBlock(uri) {
+			if err != nil {
 				return
 			}
-			if env := c.Environment(); env != nil {
-				if resp, e2 := env.CreateWebResourceResponse(nil, 200, "OK", ""); e2 == nil {
-					_ = args.PutResponse(resp)
+			host := extractHost(uri)
+			blocked := blocker.ShouldBlock(uri)
+			nl.record(host, uri, blocked)
+			if blocked {
+				al.record("blocked", host)
+				if env := c.Environment(); env != nil {
+					if resp, e2 := env.CreateWebResourceResponse(nil, 200, "OK", ""); e2 == nil {
+						_ = args.PutResponse(resp)
+					}
+				}
+			}
+			// on_request_count rotation: fire on the UI thread when threshold hit.
+			if p.rotState != nil {
+				if newProf, rotated := p.rotState.IncrementRequests(); rotated {
+					mw := p.mainWindow
+					mw.Synchronize(func() {
+						p.br.UpdateProfile(newProf)
+						_ = p.injectPolyfill()
+						p.auditLog.record("rotation", "request-count rotation → "+newProf.Name)
+					})
 				}
 			}
 		}
@@ -253,7 +314,7 @@ func NewWebViewPanel(
 		p.log.Info("ad/tracker blocker wired to WebResourceRequested")
 	}
 
-	// в”Ђв”Ђ Download-shelf push в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Download-shelf push в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Whenever the download list changes, push updated JSON to the JS shelf.
 	dlMgr.onChange = func() {
 		data, _ := json.Marshal(dlMgr.All())
@@ -261,7 +322,7 @@ func NewWebViewPanel(
 		mw.Synchronize(func() { wv.Eval(js) })
 	}
 
-	// в”Ђв”Ђ Frameless chrome в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Frameless chrome в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
 	p.wvHWND = wvHWND
 	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
@@ -277,7 +338,7 @@ func NewWebViewPanel(
 	dwmapi.NewProc("DwmSetWindowAttribute").Call(
 		uintptr(wvHWND), 33, uintptr(unsafe.Pointer(&cornerPref)), 4)
 
-	// в”Ђв”Ђ Toolbar WebView2 (isolated 82 px window above content) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Toolbar WebView2 (isolated 82 px window above content) в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Created separately from the content WebView2 so page scripts can never
 	// interfere with the tab strip or address bar.
 	tbarWv := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -313,18 +374,18 @@ func NewWebViewPanel(
 		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
 	win.ShowWindow(tbHWND, win.SW_SHOW)
 
-	// в”Ђв”Ђ Window management bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Window management bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	const swMaximize = 3
 
-	// в”Ђв”Ђ Debug helper в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Debug helper в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostDebug", func(msg string) {
 		p.log.Info("JS-DEBUG: " + msg)
 	})
 
-	// в”Ђв”Ђ Tab state (persistence only вЂ” live state is owned by toolbar WebView2) в”Ђ
+	// в"Ђв"Ђ Tab state (persistence only вЂ" live state is owned by toolbar WebView2) в"Ђ
 	p.loadTabsJSON()
 
-	// в”Ђв”Ђ Resize (bottom/side edges вЂ” top edge handled by toolbar WebView2) в”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Resize (bottom/side edges вЂ" top edge handled by toolbar WebView2) в"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostStartResize", func(ht int) {
 		var pt win.POINT
 		win.GetCursorPos(&pt)
@@ -333,7 +394,7 @@ func NewWebViewPanel(
 		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, uintptr(ht), lp)
 	})
 
-	// в”Ђв”Ђ Content в†’ toolbar forwarding bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Content в†’ toolbar forwarding bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// These let keyboard shortcuts and the context menu in the content WebView2
 	// reach the toolbar WebView2 through Go without any JS-to-JS cross-frame call.
 	p.wv.Bind("__ghostNewTab", func() {
@@ -376,7 +437,7 @@ func NewWebViewPanel(
 		})
 	})
 
-	// в”Ђв”Ђ Toolbar WebView2 bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Toolbar WebView2 bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.toolbarWv.Bind("__tbMinimize", func() {
 		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
 	})
@@ -443,9 +504,15 @@ func NewWebViewPanel(
 					`<script>window.__ghostInitTabs=`+tabsJSON+`;</script></head>`, 1)
 			}
 			dataURL := "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html))
-			p.mainWindow.Synchronize(func() { p.wv.Navigate(dataURL) })
+			p.mainWindow.Synchronize(func() {
+				p.tabsJSON = tabsJSON
+				p.wv.Navigate(dataURL)
+			})
 		} else {
-			p.mainWindow.Synchronize(func() { p.wv.Navigate(url) })
+			p.mainWindow.Synchronize(func() {
+				p.tabsJSON = tabsJSON
+				p.wv.Navigate(url)
+			})
 		}
 	})
 	p.toolbarWv.Bind("__tbAddBookmark", func(url, title string) {
@@ -486,7 +553,7 @@ func NewWebViewPanel(
 		p.log.Info("TB-DEBUG: " + msg)
 	})
 
-	// в”Ђв”Ђ Bookmark bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Bookmark bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostAddBookmark", func(url, title string) {
 		_, _ = p.bookmarks.Add(url, title)
 		p.mainWindow.Synchronize(func() {
@@ -507,7 +574,7 @@ func NewWebViewPanel(
 		return p.bookmarks.Has(url)
 	})
 
-	// в”Ђв”Ђ History bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ History bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostRecordHistory", func(url, title string) {
 		p.browsingHist.Record(url, title)
 	})
@@ -522,7 +589,7 @@ func NewWebViewPanel(
 		p.browsingHist.Clear()
 	})
 
-	// в”Ђв”Ђ Download bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Download bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetDownloads", func() string {
 		data, _ := json.Marshal(p.dlMgr.All())
 		return string(data)
@@ -538,12 +605,12 @@ func NewWebViewPanel(
 		_ = exec.Command("explorer", "/select,", path).Start()
 	})
 
-	// в”Ђв”Ђ Blocker bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Blocker bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetBlockedCount", func() int64 {
 		return p.blocker.BlockedCount()
 	})
 
-	// в”Ђв”Ђ DevTools binding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ DevTools binding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Called from the HTML context menu and the F12 action.
 	// JS bindings run in a goroutine, so Synchronize onto the UI thread first.
 	p.wv.Bind("__ghostOpenDevTools", func() {
@@ -552,7 +619,7 @@ func NewWebViewPanel(
 		})
 	})
 
-	// в”Ђв”Ђ Privacy bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Privacy bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetPrivacyData", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -575,7 +642,7 @@ func NewWebViewPanel(
 		return string(b)
 	})
 
-	// в”Ђв”Ђ Settings bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Settings bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetProfile", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -617,47 +684,95 @@ func NewWebViewPanel(
 			prof.Browser.Languages = []string{cfg.Language}
 		}
 		p.br.UpdateProfile(&prof)
+		p.auditLog.record("settings-save", "profile settings updated for "+prof.Name)
 		if err := p.injectPolyfill(); err != nil {
 			p.log.Warn("polyfill re-injection after settings save failed", "error", err.Error())
 		}
 	})
 
-	// в”Ђв”Ђ Profile switcher bindings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Profile switcher bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostListProfiles", func() string {
-		prof := p.br.Profile()
-		items := []profileListItem{{
-			ID:      prof.ID,
-			Name:    prof.Name,
-			OS:      prof.Hardware.Platform,
-			Browser: extractBrowserName(prof.Browser.UserAgent),
-			Active:  true,
-		}}
+		activeID := p.br.Profile().ID
+		var items []profileListItem
+		if p.identityStore != nil {
+			if metas, err := p.identityStore.List(); err == nil {
+				for _, m := range metas {
+					item := profileListItem{ID: m.ID, Name: m.Name, Active: m.ID == activeID}
+					if full, err2 := p.identityStore.Load(m.ID); err2 == nil {
+						item.OS = full.Hardware.Platform
+						item.Browser = extractBrowserName(full.Browser.UserAgent)
+					}
+					items = append(items, item)
+				}
+			}
+		}
+		if len(items) == 0 {
+			prof := p.br.Profile()
+			items = []profileListItem{{
+				ID: prof.ID, Name: prof.Name,
+				OS: prof.Hardware.Platform, Browser: extractBrowserName(prof.Browser.UserAgent),
+				Active: true,
+			}}
+		}
 		b, _ := json.Marshal(items)
 		return string(b)
 	})
 	p.wv.Bind("__ghostSwitchProfile", func(id string) {
-		p.log.Info("ghost switch profile", "id", id)
+		if p.identityStore == nil {
+			return
+		}
+		newProf, err := p.identityStore.Load(id)
+		if err != nil {
+			p.log.Warn("switch profile: load failed", "id", id, "error", err.Error())
+			return
+		}
+		p.br.UpdateProfile(newProf)
+		if p.rotState != nil {
+			if rs, e2 := identity.NewRotationState(newProf, p.rotPolicy); e2 == nil {
+				p.rotState = rs
+			}
+		}
+		if err2 := p.injectPolyfill(); err2 != nil {
+			p.log.Warn("polyfill re-injection after profile switch failed", "error", err2.Error())
+		}
+		p.auditLog.record("profile-switch", "switched to "+newProf.Name)
+		p.log.Info("profile switched", "id", id, "name", newProf.Name)
 	})
 
-	// в”Ђв”Ђ Navigate binding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Navigate binding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostNavigate", p.handleGhostScheme)
 
-	if err := p.injectPolyfill(); err != nil {
-		p.log.Warn("polyfill injection failed", "error", err.Error())
-	}
-	p.injectChromeOverlay()
-	p.injectResizeEdges()
-	p.injectKeyboardShortcuts()
-	p.bindEventBridge()
+	// ── Network log / Audit log / Blocklist bindings ──────────────────────────
+	p.wv.Bind("__ghostGetNetworkLog", func() string {
+		b, _ := json.Marshal(p.netLog.snapshot())
+		return string(b)
+	})
+	p.wv.Bind("__ghostClearNetworkLog", func() { p.netLog.clear() })
+	p.wv.Bind("__ghostGetAuditLog", func() string {
+		b, _ := json.Marshal(p.auditLog.snapshot())
+		return string(b)
+	})
+	p.wv.Bind("__ghostFetchBlocklist", func(url string) string {
+		if err := p.blocker.FetchAndReload(url); err != nil {
+			return err.Error()
+		}
+		p.auditLog.record("blocklist", "reloaded from "+url)
+		return ""
+	})
 
-	// в”Ђв”Ђ Initial layout: content below toolbar в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// setupContentView registers all content bindings on p.wv with the
+	// active-tab guards and injects all persistent polyfill/overlay scripts.
+	// It runs after the inline bindings above so its versions win.
+	p.setupContentView(p.wv)
+
+	// в"Ђв"Ђ Initial layout: content below toolbar в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	{
 		var cr win.RECT
 		win.GetClientRect(wvHWND, &cr)
 		p.setWebViewBounds(0, toolbarH, int(cr.Right), int(cr.Bottom))
 	}
 
-	// в”Ђв”Ђ Navigate toolbar to its standalone HTML page в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+	// в"Ђв"Ђ Navigate toolbar to its standalone HTML page в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	{
 		html := p.ghostToolbarPage()
 		if p.tabsJSON != "" {
@@ -671,7 +786,7 @@ func NewWebViewPanel(
 	return p, nil
 }
 
-// в”Ђв”Ђ navigation в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ navigation в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) Navigate(url string) {
 	if p.wv == nil {
@@ -740,7 +855,7 @@ func (p *WebViewPanel) UpdateProfile() {
 	}
 }
 
-// в”Ђв”Ђ Minimal content overlay в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ Minimal content overlay в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 // The browser chrome (toolbar, tabs, address bar) now lives in a dedicated
 // toolbar WebView2.  This overlay only provides: context menu, window.open /
 // target=_blank intercepts, download shelf, and the find bar.
@@ -751,7 +866,7 @@ func (p *WebViewPanel) injectChromeOverlay() {
 try{if(window!==window.top)return;}catch(e){return;}
 var _searchURL=%q;
 
-/* в”Ђв”Ђ Download shelf в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ Download shelf в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _dlShelf=document.createElement('div');_dlShelf.id='_gs_dl_shelf';
 _dlShelf.style.cssText=
   'position:fixed;bottom:0;left:0;right:0;z-index:2147483646;'+
@@ -806,7 +921,7 @@ window._dlPush=function _dlPush(items){
   if(!hasActive){setTimeout(_dlClose,4000);}
 };
 
-/* в”Ђв”Ђ Find bar в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ Find bar в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _fb=null;
 function _ensureFb(){
   if(_fb&&document.getElementById('_gs_find'))return;
@@ -838,7 +953,7 @@ function _ensureFb(){
 window._gsOpenFind=function(){_ensureFb();if(!_fb)return;_fb.style.display='flex';setTimeout(function(){var fi=document.getElementById('_gs_fi');if(fi){fi.focus();fi.select();}},50);};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(_fb)_fb.style.display='none';}},true);
 
-/* в”Ђв”Ђ Context menu в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ Context menu в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _cm=null;
 function _ensureCm(){
   if(_cm&&document.getElementById('_gs_ctx'))return;
@@ -897,7 +1012,7 @@ function _showCtx(e){
 document.addEventListener('contextmenu',function(e){e.preventDefault();_showCtx(e);},true);
 document.addEventListener('click',function(e){if(_cm&&!_cm.contains(e.target))_cm.style.display='none';},true);
 
-/* в”Ђв”Ђ New-window / target=_blank intercepts в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ New-window / target=_blank intercepts в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 (function(){
   var _wo=window.open;
   window.open=function(url,name,feat){
@@ -917,7 +1032,7 @@ document.addEventListener('click',function(e){
   try{__ghostOpenInNewTab(a.href);}catch(_){}
 },true);
 
-/* в”Ђв”Ђ Download click intercept в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ Download click intercept в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 document.addEventListener('click',function(e){
   var a=e.target.closest('a[download]');
   if(!a||!a.href)return;
@@ -925,7 +1040,7 @@ document.addEventListener('click',function(e){
   try{__ghostDownloadStarted(a.href,fname,0);}catch(_){}
 },true);
 
-/* в”Ђв”Ђ Record history on page load в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ */
+/* в"Ђв"Ђ Record history on page load в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 window.addEventListener('load',function(){
   try{
     var u=window.location.href;
@@ -937,10 +1052,17 @@ window.addEventListener('load',function(){
 	p.wv.Init(script)
 }
 
+func (p *WebViewPanel) injectChromeOverlayOn(wv webview2.WebView) {
+	orig := p.wv
+	p.wv = wv
+	p.injectChromeOverlay()
+	p.wv = orig
+}
+
 // injectResizeEdges injects a JS listener that detects cursor proximity to
 // viewport edges and calls __ghostStartResize.
-func (p *WebViewPanel) injectResizeEdges() {
-	p.wv.Init(`(function(){
+func (p *WebViewPanel) injectResizeEdgesOn(wv webview2.WebView) {
+	wv.Init(`(function(){
 'use strict';
 try{if(window!==window.top)return;}catch(e){return;}
 var HT={l:10,r:11,t:12,tl:13,tr:14,b:15,bl:16,br:17};
@@ -966,8 +1088,10 @@ document.addEventListener('mousedown',function(e){
 })();`)
 }
 
-func (p *WebViewPanel) injectKeyboardShortcuts() {
-	p.wv.Init(`(function(){
+func (p *WebViewPanel) injectResizeEdges() { p.injectResizeEdgesOn(p.wv) }
+
+func (p *WebViewPanel) injectKeyboardShortcutsOn(wv webview2.WebView) {
+	wv.Init(`(function(){
 'use strict';
 try{if(window!==window.top)return;}catch(e){return;}
 window.addEventListener('keydown',function(e){
@@ -989,6 +1113,8 @@ window.addEventListener('keydown',function(e){
 });
 })();`)
 }
+
+func (p *WebViewPanel) injectKeyboardShortcuts() { p.injectKeyboardShortcutsOn(p.wv) }
 
 // ghostPageDataURL builds a ghost:// page, injects the current tab state as
 // window.__ghostInitTabs so _load() can restore it synchronously without the
@@ -1019,16 +1145,16 @@ func (p *WebViewPanel) ghostPageHTML(url string) string {
 		return p.ghostProfilesPage()
 	case "settings":
 		return p.ghostSettingsPage()
+	case "network":
+		return p.ghostNetworkPage()
+	case "audit":
+		return p.ghostAuditPage()
 	}
 
 	var body string
 	switch page {
 	case "newtab", "":
 		body = "<h2>Ghost-Silicon</h2><p style=\"margin-top:10px;opacity:.7\">Type an address above and press Enter.</p>"
-	case "network":
-		body = "<h2>Network Monitor</h2><p>Coming soon.</p>"
-	case "audit":
-		body = "<h2>Audit Log</h2><p>Coming soon.</p>"
 	default:
 		body = "<h2>" + page + "</h2><p>Page not found.</p>"
 	}
@@ -1249,7 +1375,7 @@ function render(items){
       '<div class="dl-url">'+esc(it.URL||'')+'</div>'+
       '<div class="dl-bar"><div class="dl-fill" style="width:'+pct+'%"></div></div>'+
       '<div class="dl-foot"><span>'+esc(states[it.State]||'Unknown')+
-      (it.State===0&&it.TotalBytes>0?' вЂ” '+pct+'%':'')+
+      (it.State===0&&it.TotalBytes>0?' вЂ" '+pct+'%':'')+
       '</span>'+
       (it.State===1&&it.Destination?'<button class="open-btn" data-path="'+esc(it.Destination)+'">Open folder</button>':'')+
       '</div>';
@@ -1411,7 +1537,96 @@ load();
 	return ghostPageBase("settings", css, body)
 }
 
-// в”Ђв”Ђ event bridge в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+func (p *WebViewPanel) ghostNetworkPage() string {
+	css := `.subtitle{font-size:13px;color:rgba(255,255,255,.45);margin-top:-14px;margin-bottom:20px}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.btn{padding:6px 16px;border:1px solid rgba(255,255,255,.2);border-radius:6px;background:rgba(255,255,255,.07);color:#E8E8F4;font-size:12px;cursor:pointer}
+.btn:hover{background:rgba(255,255,255,.13)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:6px 8px;color:rgba(255,255,255,.4);font-weight:500;border-bottom:1px solid rgba(255,255,255,.1)}
+td{padding:5px 8px;vertical-align:top;border-bottom:1px solid rgba(255,255,255,.05);font-family:monospace;word-break:break-all}
+tr.blocked td{color:#FF6B6B}
+tr.allowed td{color:rgba(255,255,255,.75)}
+.badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600}
+.b-block{background:rgba(255,80,80,.25);color:#FF8080}
+.b-allow{background:rgba(80,200,120,.15);color:#80C880}
+.stat{font-size:22px;font-weight:700;color:#A080FF;display:inline-block;margin-right:6px}`
+	body := `<h1>Network Monitor</h1>
+<p class="subtitle">Live request log — last ` + fmt.Sprintf("%d", netLogCap) + ` requests</p>
+<div class="toolbar">
+  <span id="stats"></span>
+  <button class="btn" onclick="__ghostClearNetworkLog().then(refresh)">Clear</button>
+</div>
+<table>
+  <thead><tr><th>Time</th><th>Host</th><th>Status</th><th>URL</th></tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<script>
+function fmt(ts){var d=new Date(ts);return d.toLocaleTimeString();}
+function trunc(s,n){return s.length>n?s.slice(0,n)+'…':s;}
+function refresh(){
+  __ghostGetNetworkLog().then(function(j){
+    var rows=JSON.parse(j);
+    var blocked=rows.filter(function(r){return r.blocked;}).length;
+    document.getElementById('stats').innerHTML=
+      '<span class="stat">'+rows.length+'</span>requests&nbsp;&nbsp;'+
+      '<span class="stat" style="color:#FF8080">'+blocked+'</span>blocked';
+    var tb=document.getElementById('tbody');
+    tb.innerHTML=rows.map(function(r){
+      var cls=r.blocked?'blocked':'allowed';
+      var badge=r.blocked?'<span class="badge b-block">BLOCKED</span>':'<span class="badge b-allow">OK</span>';
+      return '<tr class="'+cls+'"><td>'+fmt(r.ts)+'</td><td>'+r.host+'</td><td>'+badge+'</td><td>'+trunc(r.url,120)+'</td></tr>';
+    }).join('');
+  });
+}
+refresh();setInterval(refresh,1500);
+</script>`
+	return ghostPageBase("network", css, body)
+}
+
+func (p *WebViewPanel) ghostAuditPage() string {
+	css := `.subtitle{font-size:13px;color:rgba(255,255,255,.45);margin-top:-14px;margin-bottom:20px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:6px 8px;color:rgba(255,255,255,.4);font-weight:500;border-bottom:1px solid rgba(255,255,255,.1)}
+td{padding:5px 8px;vertical-align:top;border-bottom:1px solid rgba(255,255,255,.05)}
+td:last-child{font-family:monospace;font-size:11px;word-break:break-all;color:rgba(255,255,255,.65)}
+.tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:600}
+.t-navigate{background:rgba(80,140,255,.2);color:#80AAFF}
+.t-profile-switch{background:rgba(255,160,80,.2);color:#FFA050}
+.t-settings-save{background:rgba(80,200,120,.2);color:#80C880}
+.t-rotation{background:rgba(160,80,255,.2);color:#C080FF}
+.t-blocked{background:rgba(255,80,80,.2);color:#FF8080}
+.t-blocklist{background:rgba(80,200,200,.2);color:#80DDDD}
+.t-start{background:rgba(200,200,80,.2);color:#D0D050}
+.t-default{background:rgba(255,255,255,.1);color:rgba(255,255,255,.6)}`
+	body := `<h1>Audit Log</h1>
+<p class="subtitle">Browser events this session</p>
+<table>
+  <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<script>
+var colorMap={navigate:'t-navigate','profile-switch':'t-profile-switch','settings-save':'t-settings-save',
+  rotation:'t-rotation',blocked:'t-blocked',blocklist:'t-blocklist',start:'t-start'};
+function fmt(ts){var d=new Date(ts);return d.toLocaleTimeString();}
+function refresh(){
+  __ghostGetAuditLog().then(function(j){
+    var rows=JSON.parse(j);
+    var tb=document.getElementById('tbody');
+    tb.innerHTML=rows.map(function(r){
+      var cls=colorMap[r.type]||'t-default';
+      return '<tr><td>'+fmt(r.ts)+'</td>'+
+        '<td><span class="tag '+cls+'">'+r.type+'</span></td>'+
+        '<td>'+r.detail+'</td></tr>';
+    }).join('');
+  });
+}
+refresh();setInterval(refresh,2000);
+</script>`
+	return ghostPageBase("audit", css, body)
+}
+
+// в"Ђв"Ђ event bridge в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 // ghostToolbarPage returns the standalone 82 px HTML page loaded into the
 // toolbar WebView2.  All chrome interactions use __tb* Go bindings.
@@ -1769,18 +1984,201 @@ try{__tbOnLoad();}catch(_){}
 </html>`
 }
 
-func (p *WebViewPanel) bindEventBridge() {
-	p.wv.Bind("__ghostOnNavStart", func(url string) {
+// setupContentView registers all content-side Go bindings and injects all
+// persistent JS scripts into wv.  Call once per content WebView2 instance
+// (the initial p.wv and every pool slot).
+func (p *WebViewPanel) setupContentView(wv webview2.WebView) {
+	wv.Bind("__ghostAddBookmark", func(url, title string) {
+		_, _ = p.bookmarks.Add(url, title)
+		p.mainWindow.Synchronize(func() {
+			p.wv.Eval("if(typeof _bmBarUpdate==='function')_bmBarUpdate();")
+		})
+	})
+	wv.Bind("__ghostRemoveBookmark", func(url string) {
+		_ = p.bookmarks.RemoveByURL(url)
+		p.mainWindow.Synchronize(func() {
+			p.wv.Eval("if(typeof _bmBarUpdate==='function')_bmBarUpdate();")
+		})
+	})
+	wv.Bind("__ghostGetBookmarks", func() string {
+		data, _ := json.Marshal(p.bookmarks.All())
+		return string(data)
+	})
+	wv.Bind("__ghostIsBookmarked", func(url string) bool { return p.bookmarks.Has(url) })
+	wv.Bind("__ghostRecordHistory", func(url, title string) { p.browsingHist.Record(url, title) })
+	wv.Bind("__ghostGetHistory", func() string {
+		data, _ := json.Marshal(p.browsingHist.All())
+		return string(data)
+	})
+	wv.Bind("__ghostDeleteHistoryEntry", func(url string) { p.browsingHist.DeleteByURL(url) })
+	wv.Bind("__ghostClearHistory", func() { p.browsingHist.Clear() })
+	wv.Bind("__ghostGetDownloads", func() string {
+		data, _ := json.Marshal(p.dlMgr.All())
+		return string(data)
+	})
+	wv.Bind("__ghostDownloadStarted", func(url, filename string, total int64) string {
+		dir := filepath.Join(p.userDataDir, "Downloads")
+		return p.dlMgr.Start(url, filename, filepath.Join(dir, filename), total)
+	})
+	wv.Bind("__ghostOpenFolder", func(path string) {
+		if path != "" {
+			_ = exec.Command("explorer", "/select,", path).Start()
+		}
+	})
+	wv.Bind("__ghostGetBlockedCount", func() int64 { return p.blocker.BlockedCount() })
+	wv.Bind("__ghostOpenDevTools", func() {
+		p.mainWindow.Synchronize(func() { p.EmbedDevToolsToggle() })
+	})
+	wv.Bind("__ghostGetPrivacyData", func() string {
+		cfg := p.buildConfig()
+		prof := p.br.Profile()
+		d := privacyData{
+			ProfileName: prof.Name, BlockedCount: p.blocker.BlockedCount(),
+			UserAgent: cfg.UserAgent, Platform: cfg.Platform, Language: cfg.Language,
+			Timezone: cfg.Timezone, HardwareConcurrency: cfg.HardwareConcurrency,
+			DeviceMemory: cfg.DeviceMemory, GPUVendor: cfg.GPUVendor,
+			GPURenderer: cfg.GPURenderer, CanvasSeed: cfg.CanvasSeed,
+			AudioSeed: cfg.AudioSeed, WebGLSeed: cfg.WebGLSeed,
+		}
+		b, _ := json.Marshal(d)
+		return string(b)
+	})
+	wv.Bind("__ghostGetProfile", func() string {
+		cfg := p.buildConfig()
+		prof := p.br.Profile()
+		d := profileDataFull{
+			ProfileName: prof.Name, UserAgent: cfg.UserAgent, Platform: cfg.Platform,
+			Language: cfg.Language, Languages: cfg.Languages, Timezone: cfg.Timezone,
+			HardwareConcurrency: cfg.HardwareConcurrency, DeviceMemory: cfg.DeviceMemory,
+			GPUVendor: cfg.GPUVendor, GPURenderer: cfg.GPURenderer,
+			CanvasSeed: cfg.CanvasSeed, AudioSeed: cfg.AudioSeed,
+			WebGLSeed: cfg.WebGLSeed, FontSeed: cfg.FontSeed,
+		}
+		b, _ := json.Marshal(d)
+		return string(b)
+	})
+	wv.Bind("__ghostSaveProfile", func(jsonStr string) {
+		var cfg profileDataFull
+		if err := json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+			return
+		}
+		prof := *p.br.Profile()
+		prof.Browser.UserAgent = cfg.UserAgent
+		prof.Hardware.Platform = cfg.Platform
+		prof.Network.Timezone = cfg.Timezone
+		if cfg.HardwareConcurrency > 0 {
+			prof.Hardware.CPUCores = cfg.HardwareConcurrency
+		}
+		if cfg.DeviceMemory > 0 {
+			prof.Hardware.RAMMb = int(cfg.DeviceMemory * 1024)
+		}
+		if cfg.Language != "" {
+			prof.Browser.Languages = []string{cfg.Language}
+		}
+		p.br.UpdateProfile(&prof)
+		p.auditLog.record("settings-save", "profile settings updated for "+prof.Name)
+		if err := p.injectPolyfill(); err != nil {
+			p.log.Warn("polyfill re-injection after settings save failed", "error", err.Error())
+		}
+	})
+	wv.Bind("__ghostListProfiles", func() string {
+		activeID := p.br.Profile().ID
+		var items []profileListItem
+		if p.identityStore != nil {
+			if metas, err := p.identityStore.List(); err == nil {
+				for _, m := range metas {
+					item := profileListItem{ID: m.ID, Name: m.Name, Active: m.ID == activeID}
+					if full, err2 := p.identityStore.Load(m.ID); err2 == nil {
+						item.OS = full.Hardware.Platform
+						item.Browser = extractBrowserName(full.Browser.UserAgent)
+					}
+					items = append(items, item)
+				}
+			}
+		}
+		if len(items) == 0 {
+			prof := p.br.Profile()
+			items = []profileListItem{{
+				ID: prof.ID, Name: prof.Name,
+				OS: prof.Hardware.Platform, Browser: extractBrowserName(prof.Browser.UserAgent),
+				Active: true,
+			}}
+		}
+		b, _ := json.Marshal(items)
+		return string(b)
+	})
+	wv.Bind("__ghostSwitchProfile", func(id string) {
+		if p.identityStore == nil {
+			return
+		}
+		newProf, err := p.identityStore.Load(id)
+		if err != nil {
+			p.log.Warn("switch profile: load failed", "id", id, "error", err.Error())
+			return
+		}
+		p.br.UpdateProfile(newProf)
+		if p.rotState != nil {
+			if rs, e2 := identity.NewRotationState(newProf, p.rotPolicy); e2 == nil {
+				p.rotState = rs
+			}
+		}
+		if err2 := p.injectPolyfill(); err2 != nil {
+			p.log.Warn("polyfill re-injection after profile switch failed", "error", err2.Error())
+		}
+		p.auditLog.record("profile-switch", "switched to "+newProf.Name)
+		p.log.Info("profile switched", "id", id, "name", newProf.Name)
+	})
+	wv.Bind("__ghostNavigate", p.handleGhostScheme)
+	wv.Bind("__ghostGetNetworkLog", func() string {
+		b, _ := json.Marshal(p.netLog.snapshot())
+		return string(b)
+	})
+	wv.Bind("__ghostClearNetworkLog", func() { p.netLog.clear() })
+	wv.Bind("__ghostGetAuditLog", func() string {
+		b, _ := json.Marshal(p.auditLog.snapshot())
+		return string(b)
+	})
+	wv.Bind("__ghostFetchBlocklist", func(url string) string {
+		if err := p.blocker.FetchAndReload(url); err != nil {
+			return err.Error()
+		}
+		p.auditLog.record("blocklist", "reloaded from "+url)
+		return ""
+	})
+	// Inject persistent scripts.
+	if err := p.injectPolyfillOn(wv); err != nil {
+		p.log.Warn("polyfill injection failed for slot", "error", err.Error())
+	}
+	p.injectChromeOverlayOn(wv)
+	p.injectResizeEdgesOn(wv)
+	p.injectKeyboardShortcutsOn(wv)
+	p.bindEventBridgeOn(wv)
+}
+
+func (p *WebViewPanel) bindEventBridge() { p.bindEventBridgeOn(p.wv) }
+
+func (p *WebViewPanel) bindEventBridgeOn(wv webview2.WebView) {
+	thisWV := wv // captured for active-tab guard
+	wv.Bind("__ghostOnNavStart", func(url string) {
+		if thisWV != p.wv {
+			return
+		}
 		if p.OnLoadStart != nil {
 			p.OnLoadStart(url)
 		}
 	})
-	p.wv.Bind("__ghostOnNavDone", func(url string) {
+	wv.Bind("__ghostOnNavDone", func(url string) {
+		if thisWV != p.wv {
+			return
+		}
 		if p.OnLoadComplete != nil {
 			p.OnLoadComplete(url)
 		}
 	})
-	p.wv.Bind("__ghostOnTitle", func(title string) {
+	wv.Bind("__ghostOnTitle", func(title string) {
+		if thisWV != p.wv {
+			return
+		}
 		if p.toolbarWv != nil {
 			titleJSON, _ := json.Marshal(title)
 			p.mainWindow.Synchronize(func() {
@@ -1791,10 +2189,14 @@ func (p *WebViewPanel) bindEventBridge() {
 			p.OnTitleChange(title)
 		}
 	})
-	p.wv.Bind("__ghostOnURL", func(url string) {
-		// Skip data: URLs вЂ” the Navigate() method already pushed the ghost:// URL.
+	wv.Bind("__ghostOnURL", func(url string) {
+		if thisWV != p.wv {
+			return
+		}
+		// Skip data: URLs — the Navigate() method already pushed the ghost:// URL.
 		if !strings.HasPrefix(url, "data:") {
 			p.curURL = url
+			p.auditLog.record("navigate", url)
 			if p.toolbarWv != nil {
 				urlJSON, _ := json.Marshal(url)
 				p.mainWindow.Synchronize(func() {
@@ -1806,13 +2208,16 @@ func (p *WebViewPanel) bindEventBridge() {
 			p.OnURLChange(url)
 		}
 	})
-	p.wv.Bind("__ghostOnError", func(url, msg string) {
+	wv.Bind("__ghostOnError", func(url, msg string) {
+		if thisWV != p.wv {
+			return
+		}
 		if p.OnLoadError != nil {
 			p.OnLoadError(url, msg)
 		}
 	})
 
-	p.wv.Init(`(function(){
+	wv.Init(`(function(){
 'use strict';
 function _pageURL(){return window.__ghostPageURL||window.location.href;}
 if(window.navigation){
@@ -1855,7 +2260,7 @@ window.addEventListener('popstate',function(){
 })();`)
 }
 
-// в”Ђв”Ђ helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ helpers в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func extractBrowserName(ua string) string {
 	switch {
@@ -1870,7 +2275,7 @@ func extractBrowserName(ua string) string {
 	}
 }
 
-// в”Ђв”Ђ polyfill в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ polyfill в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 type profileConfig struct {
 	UserAgent           string   `json:"userAgent"`
@@ -1974,11 +2379,28 @@ def(scr,'colorDepth',_ghost.colorDepth);def(scr,'pixelDepth',_ghost.pixelDepth);
 def(window,'devicePixelRatio',_ghost.devicePixelRatio);
 if(_ghost.canvasSeed!==0){var oTDU=HTMLCanvasElement.prototype.toDataURL;var oGID=CanvasRenderingContext2D.prototype.getImageData;var _s=_ghost.canvasSeed;function lcg(s){return((s*1664525+1013904223)&0xFFFFFFFF)>>>0;}HTMLCanvasElement.prototype.toDataURL=function(type,quality){var ctx=this.getContext('2d');if(ctx){var id=oGID.call(ctx,0,0,this.width,this.height);var s=_s;for(var i=0;i<id.data.length;i+=4){s=lcg(s);id.data[i]^=(s&0x01);id.data[i+1]^=((s>>1)&0x01);id.data[i+2]^=((s>>2)&0x01);}ctx.putImageData(id,0,0);}return oTDU.call(this,type,quality);};}
 var oGP=WebGLRenderingContext.prototype.getParameter;WebGLRenderingContext.prototype.getParameter=function(p){var e=this.getExtension('WEBGL_debug_renderer_info');if(e){if(p===e.UNMASKED_VENDOR_WEBGL)return _ghost.gpuVendor;if(p===e.UNMASKED_RENDERER_WEBGL)return _ghost.gpuRenderer;}return oGP.call(this,p);};
-if(_ghost.timezone){var oRO=Intl.DateTimeFormat.prototype.resolvedOptions;Intl.DateTimeFormat.prototype.resolvedOptions=function(){var o=oRO.call(this);o.timeZone=_ghost.timezone;return o;};}
+if(_ghost.timezone){var oRO=Intl.DateTimeFormat.prototype.resolvedOptions;Intl.DateTimeFormat.prototype.resolvedOptions=function(){var o=oRO.call(this);o.timeZone=_ghost.timezone;return o;};var _tzOff=(function(){try{var now=Date.now();var parts=new Intl.DateTimeFormat('en-US',{timeZone:_ghost.timezone,year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric',hour12:false}).formatToParts(new Date(now));var v={};parts.forEach(function(p){if(p.type!=='literal')v[p.type]=parseInt(p.value,10);});var tzMs=Date.UTC(v.year,v.month-1,v.day,v.hour%%24,v.minute,v.second);return Math.round((now-tzMs)/60000);}catch(e){return 0;}})();Date.prototype.getTimezoneOffset=function(){return _tzOff;};}
+if(typeof navigator.getBattery==='function'){try{Object.defineProperty(navigator,'getBattery',{value:function(){return Promise.resolve({charging:true,chargingTime:0,dischargingTime:Infinity,level:1.0,addEventListener:function(){},removeEventListener:function(){},dispatchEvent:function(){return true;}});},configurable:false,writable:false,enumerable:true});}catch(e){}}
+try{var _ep=Object.setPrototypeOf([],PluginArray.prototype);var _em=Object.setPrototypeOf([],MimeTypeArray.prototype);Object.defineProperty(navigator,'plugins',{get:function(){return _ep;},configurable:false,enumerable:true});Object.defineProperty(navigator,'mimeTypes',{get:function(){return _em;},configurable:false,enumerable:true});try{Object.defineProperty(navigator,'pdfViewerEnabled',{get:function(){return false;},configurable:false,enumerable:true});}catch(e){}}catch(e){}
+(function(){var _mm=window.matchMedia;window.matchMedia=function(q){if(typeof q==='string'&&/prefers-color-scheme/.test(q)){var mql={matches:false,media:q,onchange:null};mql.addListener=mql.removeListener=mql.addEventListener=mql.removeEventListener=function(){};mql.dispatchEvent=function(){return false;};return mql;}return _mm.call(window,q);};})();
+if(_ghost.fontSeed!==0){var _origMT=CanvasRenderingContext2D.prototype.measureText;var _fSeed=_ghost.fontSeed>>>0;CanvasRenderingContext2D.prototype.measureText=function(text){var r=_origMT.call(this,text);var h=_fSeed;for(var i=0;i<text.length;i++){h=(Math.imul(h^text.charCodeAt(i),0x9e3779b9))>>>0;}var noise=(h/0xFFFFFFFF)*0.02;var out={width:r.width+noise};['actualBoundingBoxLeft','actualBoundingBoxRight','fontBoundingBoxAscent','fontBoundingBoxDescent','actualBoundingBoxAscent','actualBoundingBoxDescent'].forEach(function(k){if(k in r)out[k]=r[k];});return out;};}
+if(_ghost.canvasSeed!==0){var _oTB=HTMLCanvasElement.prototype.toBlob;HTMLCanvasElement.prototype.toBlob=function(cb,type,quality){var ctx=this.getContext('2d');if(ctx){var id=oGID.call(ctx,0,0,this.width,this.height);var s2=_s;for(var i=0;i<id.data.length;i+=4){s2=lcg(s2);id.data[i]^=(s2&0x01);id.data[i+1]^=((s2>>1)&0x01);id.data[i+2]^=((s2>>2)&0x01);}ctx.putImageData(id,0,0);}_oTB.call(this,cb,type,quality);};}
+if(typeof WebGL2RenderingContext!=='undefined'){var _oGP2=WebGL2RenderingContext.prototype.getParameter;WebGL2RenderingContext.prototype.getParameter=function(p){var e=this.getExtension('WEBGL_debug_renderer_info');if(e){if(p===e.UNMASKED_VENDOR_WEBGL)return _ghost.gpuVendor;if(p===e.UNMASKED_RENDERER_WEBGL)return _ghost.gpuRenderer;}return _oGP2.call(this,p);};}
+if(_ghost.audioSeed!==0&&typeof AudioBuffer!=='undefined'){var _aGCD=AudioBuffer.prototype.getChannelData;var _aSeed=_ghost.audioSeed;AudioBuffer.prototype.getChannelData=function(ch){var arr=_aGCD.call(this,ch);var s=(_aSeed^(ch*0x9e3779b9))>>>0;for(var i=0;i<arr.length;i+=100){s=(Math.imul(s,1664525)+1013904223)>>>0;arr[i]+=(s/0xFFFFFFFF-0.5)*1e-7;}return arr;};}
+if(window.performance&&performance.now){var _oPNow=performance.now.bind(performance);performance.now=function(){return Math.floor(_oPNow()*10)/10;};}
+try{if('connection' in navigator){Object.defineProperty(navigator,'connection',{get:function(){return undefined;},configurable:false,enumerable:true});}}catch(e){}
 })();`, string(cfgJSON))
 	p.wv.Init(polyfill)
 	p.log.Info("polyfill injected", "profile_id", p.br.Profile().ID)
 	return nil
+}
+
+func (p *WebViewPanel) injectPolyfillOn(wv webview2.WebView) error {
+	orig := p.wv
+	p.wv = wv
+	err := p.injectPolyfill()
+	p.wv = orig
+	return err
 }
 
 func min(a, b int) int {
@@ -1988,7 +2410,7 @@ func min(a, b int) int {
 	return b
 }
 
-// в”Ђв”Ђ frameless WndProc subclass в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ frameless WndProc subclass в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	const (
@@ -2077,7 +2499,7 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	setWndLongPtr.Call(uintptr(hwnd), gwlpWndProc, cb)
 }
 
-// в”Ђв”Ђ resize в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ resize в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) onResize() {
 	if p.wv == nil || p.mainWindow == nil {
@@ -2092,7 +2514,7 @@ func (p *WebViewPanel) onResize() {
 
 func (p *WebViewPanel) ForceResize() { p.onResize() }
 
-// в”Ђв”Ђ DevTools embedding в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ DevTools embedding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 // EmbedDevToolsToggle opens DevTools docked to the right of the page on the
 // first call, then toggles its visibility on subsequent calls.
@@ -2245,6 +2667,63 @@ func (p *WebViewPanel) setWebViewBounds(left, top, right, bottom int) {
 
 // getWebViewController extracts the *edge.ICoreWebView2Controller from the
 // unexported controller field of edge.Chromium using reflection.
+// setWVVisibleFor calls ICoreWebView2Controller.PutIsVisible (vtable slot 4)
+// to show or hide the WebView2 rendering surface without touching the HWND.
+func setWVVisibleFor(wv webview2.WebView, visible bool) {
+	c := extractChromium(wv)
+	if c == nil {
+		return
+	}
+	ctrl := getCtrlFor(c)
+	if ctrl == nil {
+		return
+	}
+	const putIsVisibleIdx = uintptr(4)
+	boolVal := uintptr(0)
+	if visible {
+		boolVal = 1
+	}
+	ctrlPtr := uintptr(unsafe.Pointer(ctrl))
+	vtbl := *(*uintptr)(unsafe.Pointer(ctrlPtr))
+	fn := *(*uintptr)(unsafe.Pointer(vtbl + putIsVisibleIdx*8))
+	syscall.SyscallN(fn, ctrlPtr, boolVal)
+}
+
+// setWVBoundsFor calls ICoreWebView2Controller.PutBounds on an arbitrary
+// WebView2 instance (not necessarily p.wv).
+func setWVBoundsFor(wv webview2.WebView, left, top, right, bottom int) {
+	c := extractChromium(wv)
+	if c == nil {
+		return
+	}
+	ctrl := getCtrlFor(c)
+	if ctrl == nil {
+		return
+	}
+	rect := win.RECT{Left: int32(left), Top: int32(top), Right: int32(right), Bottom: int32(bottom)}
+	const putBoundsVtblIdx = uintptr(6)
+	ctrlPtr := uintptr(unsafe.Pointer(ctrl))
+	vtbl := *(*uintptr)(unsafe.Pointer(ctrlPtr))
+	fn := *(*uintptr)(unsafe.Pointer(vtbl + putBoundsVtblIdx*8))
+	syscall.SyscallN(fn, ctrlPtr, uintptr(unsafe.Pointer(&rect)))
+}
+
+// getCtrlFor extracts the ICoreWebView2Controller from any Chromium instance.
+func getCtrlFor(c *edge.Chromium) *edge.ICoreWebView2Controller {
+	t := reflect.TypeOf(*c)
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Name == "controller" {
+			off := t.Field(i).Offset
+			ptr := *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(c)) + off))
+			if ptr == 0 {
+				return nil
+			}
+			return (*edge.ICoreWebView2Controller)(unsafe.Pointer(ptr))
+		}
+	}
+	return nil
+}
+
 func (p *WebViewPanel) getWebViewController() *edge.ICoreWebView2Controller {
 	c := extractChromium(p.wv)
 	if c == nil {
@@ -2264,7 +2743,7 @@ func (p *WebViewPanel) getWebViewController() *edge.ICoreWebView2Controller {
 	return nil
 }
 
-// в”Ђв”Ђ ghost:// scheme в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+// в"Ђв"Ђ ghost:// scheme в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) handleGhostScheme(url string) string {
 	return fmt.Sprintf(`<p>ghost: %s</p>`, url)

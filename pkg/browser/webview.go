@@ -1,13 +1,9 @@
 //go:build windows
 
-// Package browser вЂ" WebView2 embed and browser chrome.
 //
 // Architecture (HTML chrome):
 //
 //	go-webview2 top-level window (frameless, subclassed WndProc)
-//	в""в"Ђв"Ђ WebView2 controller (fills entire client area)
-//	    в""в"Ђв"Ђ HTML chrome overlay (position:fixed, z-index max)
-//	        вЂ" address bar, nav buttons, tab strip вЂ" all rendered as HTML
 //
 // The browser chrome (toolbar, tabs, address bar) is implemented as a
 // position:fixed HTML overlay injected into every page via
@@ -52,7 +48,6 @@ type wvBrowserSlot struct {
 
 // extractChromium reads the *edge.Chromium that go-webview2 stores inside the
 // unexported webview.browser interface field.  Safe only for pinned go-webview2
-// commit dc24628cff85 вЂ" the struct layout is stable for that revision.
 func extractChromium(wv webview2.WebView) *edge.Chromium {
 	slot := (*wvBrowserSlot)(unsafe.Pointer(reflect.ValueOf(wv).Pointer()))
 	if slot.data == 0 {
@@ -103,8 +98,6 @@ func openDevToolsWindow(c *edge.Chromium) {
 // Content WebView2 rendering always starts at y=toolbarH.
 const toolbarH = 82
 
-// в"Ђв"Ђ WebViewPanel в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
-
 // WebViewPanel wraps a go-webview2 WebView that occupies the entire Walk
 // MainWindow client area.  The browser chrome (toolbar, tabs, address bar) is
 // rendered in a separate toolbar WebView2 pinned above the content WebView2,
@@ -146,8 +139,6 @@ type WebViewPanel struct {
 	OnLoadComplete func(url string)
 	OnLoadError    func(url, errMsg string)
 }
-
-// в"Ђв"Ђ data types for JS bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 type privacyData struct {
 	ProfileName         string  `json:"profileName"`
@@ -272,7 +263,6 @@ func NewWebViewPanel(
 	p.wv = wv
 	p.log.Info("webview2 initialised")
 
-	// в"Ђв"Ђ Ad/tracker blocker в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Wire Blocker.ShouldBlock to WebResourceRequested so the badge counter
 	// reflects real blocked requests and resources are suppressed.
 	if c := extractChromium(p.wv); c != nil {
@@ -314,7 +304,6 @@ func NewWebViewPanel(
 		p.log.Info("ad/tracker blocker wired to WebResourceRequested")
 	}
 
-	// в"Ђв"Ђ Download-shelf push в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Whenever the download list changes, push updated JSON to the JS shelf.
 	dlMgr.onChange = func() {
 		data, _ := json.Marshal(dlMgr.All())
@@ -322,7 +311,6 @@ func NewWebViewPanel(
 		mw.Synchronize(func() { wv.Eval(js) })
 	}
 
-	// в"Ђв"Ђ Frameless chrome в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	wvHWND := win.HWND(uintptr(p.wv.Window()))
 	p.wvHWND = wvHWND
 	wvStyle := win.GetWindowLong(wvHWND, win.GWL_STYLE)
@@ -338,7 +326,6 @@ func NewWebViewPanel(
 	dwmapi.NewProc("DwmSetWindowAttribute").Call(
 		uintptr(wvHWND), 33, uintptr(unsafe.Pointer(&cornerPref)), 4)
 
-	// в"Ђв"Ђ Toolbar WebView2 (isolated 82 px window above content) в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Created separately from the content WebView2 so page scripts can never
 	// interfere with the tab strip or address bar.
 	tbarWv := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -374,18 +361,14 @@ func NewWebViewPanel(
 		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
 	win.ShowWindow(tbHWND, win.SW_SHOW)
 
-	// в"Ђв"Ђ Window management bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	const swMaximize = 3
 
-	// в"Ђв"Ђ Debug helper в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostDebug", func(msg string) {
 		p.log.Info("JS-DEBUG: " + msg)
 	})
 
-	// в"Ђв"Ђ Tab state (persistence only вЂ" live state is owned by toolbar WebView2) в"Ђ
 	p.loadTabsJSON()
 
-	// в"Ђв"Ђ Resize (bottom/side edges вЂ" top edge handled by toolbar WebView2) в"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostStartResize", func(ht int) {
 		var pt win.POINT
 		win.GetCursorPos(&pt)
@@ -394,7 +377,6 @@ func NewWebViewPanel(
 		win.PostMessage(wvHWND, win.WM_NCLBUTTONDOWN, uintptr(ht), lp)
 	})
 
-	// в"Ђв"Ђ Content в†’ toolbar forwarding bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// These let keyboard shortcuts and the context menu in the content WebView2
 	// reach the toolbar WebView2 through Go without any JS-to-JS cross-frame call.
 	p.wv.Bind("__ghostNewTab", func() {
@@ -437,7 +419,6 @@ func NewWebViewPanel(
 		})
 	})
 
-	// в"Ђв"Ђ Toolbar WebView2 bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.toolbarWv.Bind("__tbMinimize", func() {
 		win.PostMessage(wvHWND, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
 	})
@@ -553,7 +534,6 @@ func NewWebViewPanel(
 		p.log.Info("TB-DEBUG: " + msg)
 	})
 
-	// в"Ђв"Ђ Bookmark bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostAddBookmark", func(url, title string) {
 		_, _ = p.bookmarks.Add(url, title)
 		p.mainWindow.Synchronize(func() {
@@ -574,7 +554,6 @@ func NewWebViewPanel(
 		return p.bookmarks.Has(url)
 	})
 
-	// в"Ђв"Ђ History bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostRecordHistory", func(url, title string) {
 		p.browsingHist.Record(url, title)
 	})
@@ -589,7 +568,6 @@ func NewWebViewPanel(
 		p.browsingHist.Clear()
 	})
 
-	// в"Ђв"Ђ Download bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetDownloads", func() string {
 		data, _ := json.Marshal(p.dlMgr.All())
 		return string(data)
@@ -605,12 +583,10 @@ func NewWebViewPanel(
 		_ = exec.Command("explorer", "/select,", path).Start()
 	})
 
-	// в"Ђв"Ђ Blocker bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetBlockedCount", func() int64 {
 		return p.blocker.BlockedCount()
 	})
 
-	// в"Ђв"Ђ DevTools binding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	// Called from the HTML context menu and the F12 action.
 	// JS bindings run in a goroutine, so Synchronize onto the UI thread first.
 	p.wv.Bind("__ghostOpenDevTools", func() {
@@ -619,7 +595,6 @@ func NewWebViewPanel(
 		})
 	})
 
-	// в"Ђв"Ђ Privacy bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetPrivacyData", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -642,7 +617,6 @@ func NewWebViewPanel(
 		return string(b)
 	})
 
-	// в"Ђв"Ђ Settings bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostGetProfile", func() string {
 		cfg := p.buildConfig()
 		prof := p.br.Profile()
@@ -690,7 +664,6 @@ func NewWebViewPanel(
 		}
 	})
 
-	// в"Ђв"Ђ Profile switcher bindings в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostListProfiles", func() string {
 		activeID := p.br.Profile().ID
 		var items []profileListItem
@@ -739,7 +712,6 @@ func NewWebViewPanel(
 		p.log.Info("profile switched", "id", id, "name", newProf.Name)
 	})
 
-	// в"Ђв"Ђ Navigate binding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	p.wv.Bind("__ghostNavigate", p.handleGhostScheme)
 
 	// ── Network log / Audit log / Blocklist bindings ──────────────────────────
@@ -765,14 +737,12 @@ func NewWebViewPanel(
 	// It runs after the inline bindings above so its versions win.
 	p.setupContentView(p.wv)
 
-	// в"Ђв"Ђ Initial layout: content below toolbar в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	{
 		var cr win.RECT
 		win.GetClientRect(wvHWND, &cr)
 		p.setWebViewBounds(0, toolbarH, int(cr.Right), int(cr.Bottom))
 	}
 
-	// в"Ђв"Ђ Navigate toolbar to its standalone HTML page в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 	{
 		html := p.ghostToolbarPage()
 		if p.tabsJSON != "" {
@@ -785,8 +755,6 @@ func NewWebViewPanel(
 
 	return p, nil
 }
-
-// в"Ђв"Ђ navigation в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) Navigate(url string) {
 	if p.wv == nil {
@@ -855,7 +823,6 @@ func (p *WebViewPanel) UpdateProfile() {
 	}
 }
 
-// в"Ђв"Ђ Minimal content overlay в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 // The browser chrome (toolbar, tabs, address bar) now lives in a dedicated
 // toolbar WebView2.  This overlay only provides: context menu, window.open /
 // target=_blank intercepts, download shelf, and the find bar.
@@ -866,7 +833,6 @@ func (p *WebViewPanel) injectChromeOverlay() {
 try{if(window!==window.top)return;}catch(e){return;}
 var _searchURL=%q;
 
-/* в"Ђв"Ђ Download shelf в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _dlShelf=document.createElement('div');_dlShelf.id='_gs_dl_shelf';
 _dlShelf.style.cssText=
   'position:fixed;bottom:0;left:0;right:0;z-index:2147483646;'+
@@ -921,7 +887,6 @@ window._dlPush=function _dlPush(items){
   if(!hasActive){setTimeout(_dlClose,4000);}
 };
 
-/* в"Ђв"Ђ Find bar в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _fb=null;
 function _ensureFb(){
   if(_fb&&document.getElementById('_gs_find'))return;
@@ -953,7 +918,6 @@ function _ensureFb(){
 window._gsOpenFind=function(){_ensureFb();if(!_fb)return;_fb.style.display='flex';setTimeout(function(){var fi=document.getElementById('_gs_fi');if(fi){fi.focus();fi.select();}},50);};
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){if(_fb)_fb.style.display='none';}},true);
 
-/* в"Ђв"Ђ Context menu в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 var _cm=null;
 function _ensureCm(){
   if(_cm&&document.getElementById('_gs_ctx'))return;
@@ -1012,7 +976,6 @@ function _showCtx(e){
 document.addEventListener('contextmenu',function(e){e.preventDefault();_showCtx(e);},true);
 document.addEventListener('click',function(e){if(_cm&&!_cm.contains(e.target))_cm.style.display='none';},true);
 
-/* в"Ђв"Ђ New-window / target=_blank intercepts в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 (function(){
   var _wo=window.open;
   window.open=function(url,name,feat){
@@ -1032,7 +995,6 @@ document.addEventListener('click',function(e){
   try{__ghostOpenInNewTab(a.href);}catch(_){}
 },true);
 
-/* в"Ђв"Ђ Download click intercept в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 document.addEventListener('click',function(e){
   var a=e.target.closest('a[download]');
   if(!a||!a.href)return;
@@ -1040,7 +1002,6 @@ document.addEventListener('click',function(e){
   try{__ghostDownloadStarted(a.href,fname,0);}catch(_){}
 },true);
 
-/* в"Ђв"Ђ Record history on page load в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ */
 window.addEventListener('load',function(){
   try{
     var u=window.location.href;
@@ -1375,7 +1336,6 @@ function render(items){
       '<div class="dl-url">'+esc(it.URL||'')+'</div>'+
       '<div class="dl-bar"><div class="dl-fill" style="width:'+pct+'%"></div></div>'+
       '<div class="dl-foot"><span>'+esc(states[it.State]||'Unknown')+
-      (it.State===0&&it.TotalBytes>0?' вЂ" '+pct+'%':'')+
       '</span>'+
       (it.State===1&&it.Destination?'<button class="open-btn" data-path="'+esc(it.Destination)+'">Open folder</button>':'')+
       '</div>';
@@ -1625,8 +1585,6 @@ refresh();setInterval(refresh,2000);
 </script>`
 	return ghostPageBase("audit", css, body)
 }
-
-// в"Ђв"Ђ event bridge в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 // ghostToolbarPage returns the standalone 82 px HTML page loaded into the
 // toolbar WebView2.  All chrome interactions use __tb* Go bindings.
@@ -2260,8 +2218,6 @@ window.addEventListener('popstate',function(){
 })();`)
 }
 
-// в"Ђв"Ђ helpers в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
-
 func extractBrowserName(ua string) string {
 	switch {
 	case strings.Contains(ua, "Chrome"):
@@ -2274,8 +2230,6 @@ func extractBrowserName(ua string) string {
 		return "Browser"
 	}
 }
-
-// в"Ђв"Ђ polyfill в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 type profileConfig struct {
 	UserAgent           string   `json:"userAgent"`
@@ -2410,8 +2364,6 @@ func min(a, b int) int {
 	return b
 }
 
-// в"Ђв"Ђ frameless WndProc subclass в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
-
 func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	const (
 		gwlpWndProc   = ^uintptr(3)
@@ -2499,8 +2451,6 @@ func (p *WebViewPanel) subclassFrameless(hwnd win.HWND) {
 	setWndLongPtr.Call(uintptr(hwnd), gwlpWndProc, cb)
 }
 
-// в"Ђв"Ђ resize в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
-
 func (p *WebViewPanel) onResize() {
 	if p.wv == nil || p.mainWindow == nil {
 		return
@@ -2513,8 +2463,6 @@ func (p *WebViewPanel) onResize() {
 }
 
 func (p *WebViewPanel) ForceResize() { p.onResize() }
-
-// в"Ђв"Ђ DevTools embedding в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 // EmbedDevToolsToggle opens DevTools docked to the right of the page on the
 // first call, then toggles its visibility on subsequent calls.
@@ -2742,8 +2690,6 @@ func (p *WebViewPanel) getWebViewController() *edge.ICoreWebView2Controller {
 	}
 	return nil
 }
-
-// в"Ђв"Ђ ghost:// scheme в"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђв"Ђ
 
 func (p *WebViewPanel) handleGhostScheme(url string) string {
 	return fmt.Sprintf(`<p>ghost: %s</p>`, url)
